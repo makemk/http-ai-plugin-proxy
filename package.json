@@ -160,7 +160,7 @@
         },
         "httpAiProxy.updateSource": {
           "type": "string",
-          "default": "",
+          "default": "https://github.com/makemk/http-ai-plugin-proxy",
           "description": "插件自动更新源地址。支持直接粘贴 GitHub 仓库完整链接（例如：https://github.com/用户名/仓库名）或私有服务器链接（例如：http://你的IP/version.json）。"
         },
         "httpAiProxy.autoCheckUpdates": {
