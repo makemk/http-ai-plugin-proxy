@@ -1,0 +1,26 @@
+# Dependencies
+node_modules/
+package-lock.json
+
+# Local sensitive configuration & credentials
+deployment.local.json
+*.local.json
+*.local.env
+*.backup
+*.bak
+
+# VS Code extension packaging
+*.vsix
+.vscode-test/
+
+# Logs & temporary files
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+scratch/
+
+# OS specific
+.DS_Store
+Thumbs.db
+

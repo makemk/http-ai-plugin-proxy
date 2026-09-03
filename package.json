@@ -1,0 +1,174 @@
+{
+  "name": "http-ai-plugin-proxy",
+  "displayName": "HTTP AI 插件代理",
+  "description": "专为 Claude Code、Cline 及各类 AI 扩展设计的高性能安全 HTTP/HTTPS 代理网关",
+  "version": "1.0.0",
+  "publisher": "local",
+  "icon": "icon.png",
+  "engines": {
+    "vscode": "^1.80.0"
+  },
+  "scripts": {
+    "check": "node check-status.js",
+    "test": "node test-connection.js"
+  },
+  "categories": [
+    "Other",
+    "Network",
+    "AI"
+  ],
+  "keywords": [
+    "ai",
+    "claude-code",
+    "proxy",
+    "http-proxy",
+    "https-proxy",
+    "gateway"
+  ],
+  "main": "./src/extension.js",
+  "activationEvents": [
+    "*"
+  ],
+  "contributes": {
+    "commands": [
+      {
+        "command": "httpAiProxy.showMenu",
+        "title": "代理: 控制菜单",
+        "category": "HTTP AI 代理"
+      },
+      {
+        "command": "httpAiProxy.testConnection",
+        "title": "代理: 运行连通性与网络诊断",
+        "category": "HTTP AI 代理"
+      },
+      {
+        "command": "httpAiProxy.start",
+        "title": "代理: 启动 / 开启",
+        "category": "HTTP AI 代理"
+      },
+      {
+        "command": "httpAiProxy.stop",
+        "title": "代理: 停止 / 关闭",
+        "category": "HTTP AI 代理"
+      },
+      {
+        "command": "httpAiProxy.restart",
+        "title": "代理: 重启代理服务",
+        "category": "HTTP AI 代理"
+      },
+      {
+        "command": "httpAiProxy.openConfig",
+        "title": "代理: 打开配置文件",
+        "category": "HTTP AI 代理"
+      },
+      {
+        "command": "httpAiProxy.setSystemEnv",
+        "title": "代理: 设置 Windows 用户代理环境变量",
+        "category": "HTTP AI 代理"
+      },
+      {
+        "command": "httpAiProxy.clearSystemEnv",
+        "title": "代理: 清除 Windows 用户代理环境变量",
+        "category": "HTTP AI 代理"
+      },
+      {
+        "command": "httpAiProxy.migrateSecrets",
+        "title": "代理: 将密码安全迁移至系统凭据库 (SecretStorage)",
+        "category": "HTTP AI 代理"
+      },
+      {
+        "command": "httpAiProxy.checkForUpdates",
+        "title": "代理: 检查最新版本更新",
+        "category": "HTTP AI 代理"
+      }
+    ],
+    "configuration": {
+      "title": "HTTP AI 插件代理",
+      "properties": {
+        "httpAiProxy.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "启用或禁用 HTTP AI 插件代理网桥。"
+        },
+        "httpAiProxy.configPath": {
+          "type": "string",
+          "default": "",
+          "description": "包含 HTTPS 网关凭证的 deployment.local.json 配置文件路径（留空则自动从 ~/.browser-gateway/ 或当前工作区安全探测）。"
+        },
+        "httpAiProxy.localPort": {
+          "type": "integer",
+          "default": 18889,
+          "minimum": 1024,
+          "maximum": 65535,
+          "description": "本地正向代理监听端口（127.0.0.1:端口，支持 1024-65535）。修改后插件将自动在新的端口重启并更新代理。"
+        },
+        "httpAiProxy.autoConfigureVsCode": {
+          "type": "boolean",
+          "default": true,
+          "description": "自动配置 VS Code 全局 http.proxy 与集成终端环境变量。"
+        },
+        "httpAiProxy.tlsMinVersion": {
+          "type": "string",
+          "enum": [
+            "TLSv1.2",
+            "TLSv1.3"
+          ],
+          "default": "TLSv1.2",
+          "description": "上游 HTTPS 网关连接的最低 TLS 协议版本（推荐 TLS 1.3）。"
+        },
+        "httpAiProxy.rejectUnauthorized": {
+          "type": "boolean",
+          "default": false,
+          "description": "是否强制对上游网关进行严格 SSL/TLS 证书校验。若网关为自签名或公网 IP 证书，请保持 false。"
+        },
+        "httpAiProxy.caCertPath": {
+          "type": "string",
+          "default": "",
+          "description": "用于校验上游网关的自定义 CA 根证书文件路径（.pem / .crt，可选）。"
+        },
+        "httpAiProxy.enableConnectionPool": {
+          "type": "boolean",
+          "default": true,
+          "description": "启用上游 TLS 隧道预热就绪池（保持温热 Socket，消除 420ms 握手冷启动延迟）。"
+        },
+        "httpAiProxy.threadPoolSize": {
+          "type": "integer",
+          "default": 0,
+          "minimum": 0,
+          "maximum": 128,
+          "description": "底层 OpenSSL 密码学加速线程池大小。设为 0 表示自动侦测并压榨当前电脑 CPU 物理核心上限（你的电脑会自动激活最高 20 线程满载）；亦可手动指定具体线程数。"
+        },
+        "httpAiProxy.maxWarmSockets": {
+          "type": "integer",
+          "default": 0,
+          "minimum": 0,
+          "maximum": 16,
+          "description": "TLS 隧道弹性预热池最大容量。设为 0 表示依据电脑 CPU 核心性能自动分配最佳上限（高性能芯片自动激活最高 6 条通道）；亦可手动指定（1-16）。"
+        },
+        "httpAiProxy.bypassDomesticDomains": {
+          "type": "boolean",
+          "default": true,
+          "description": "智能分流：自动直连国内高频开发镜像（npmmirror、gitee、aliyun、.cn 等），不绕道美国 VPS。"
+        },
+        "httpAiProxy.customBypassList": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "description": "用户自定义直连白名单域名列表（通配符匹配，如 *.local, *.corp.com）。"
+        },
+        "httpAiProxy.updateSource": {
+          "type": "string",
+          "default": "",
+          "description": "插件自动更新源地址。支持直接粘贴 GitHub 仓库完整链接（例如：https://github.com/用户名/仓库名）或私有服务器链接（例如：http://你的IP/version.json）。"
+        },
+        "httpAiProxy.autoCheckUpdates": {
+          "type": "boolean",
+          "default": true,
+          "description": "VS Code 启动时是否自动在后台探测新版本并弹窗提示更新。"
+        }
+      }
+    }
+  }
+}
