@@ -21,7 +21,7 @@ class WarmPoolManager {
     if (activeRequests >= 4) {
       return this.maxWarmSockets;
     } else if (activeRequests >= 2) {
-      return Math.min(this.maxWarmSockets, Math.max(this.minWarmSockets, 4));
+      return Math.min(this.maxWarmSockets, Math.max(this.minWarmSockets, 8));
     }
     return this.minWarmSockets;
   }
@@ -31,14 +31,18 @@ class WarmPoolManager {
     while (this.warmSockets.length > 0) {
       const item = this.warmSockets.shift();
       clearTimeout(item.idleTimer);
-      if (!item.socket.destroyed && item.socket.writable) {
-        item.socket.removeAllListeners('error');
-        item.socket.removeAllListeners('close');
-        item.socket.removeAllListeners('end');
+      const sock = item.socket;
+      // Ensure the socket is truly open, writable, and has NOT received remote FIN (readableEnded)
+      if (!sock.destroyed && sock.writable && !sock.readableEnded && (sock.readyState === 'open' || !sock.readyState)) {
+        sock.removeAllListeners('error');
+        sock.removeAllListeners('close');
+        sock.removeAllListeners('end');
         if (typeof replenishCb === 'function') {
           setImmediate(replenishCb);
         }
-        return item.socket;
+        return sock;
+      } else {
+        try { sock.destroy(); } catch (_) {}
       }
     }
     if (typeof replenishCb === 'function') {
@@ -51,13 +55,15 @@ class WarmPoolManager {
     if (!this.enabled || this.isStopping) return;
     if (!tlsOptions || !tlsOptions.host) return;
 
-    // Filter out destroyed or unwritable sockets
-    this.warmSockets = this.warmSockets.filter(item => !item.socket.destroyed && item.socket.writable);
+    // Filter out destroyed, unwritable, or closed sockets
+    this.warmSockets = this.warmSockets.filter(item => !item.socket.destroyed && item.socket.writable && !item.socket.readableEnded);
 
     const targetCount = this.getDesiredWarmPoolSize(activeRequests);
-    if (this.warmSockets.length >= targetCount) return;
+    const inFlight = this.connectingCount || 0;
+    const currentTotal = this.warmSockets.length + inFlight;
+    if (currentTotal >= targetCount) return;
 
-    const needed = targetCount - this.warmSockets.length;
+    const needed = targetCount - currentTotal;
     for (let i = 0; i < needed; i++) {
       this._createWarmSocket(tlsOptions);
     }
@@ -65,24 +71,35 @@ class WarmPoolManager {
 
   _createWarmSocket(tlsOptions) {
     try {
+      this.connectingCount = (this.connectingCount || 0) + 1;
+      let connected = false;
+
+      const decrementInFlight = () => {
+        if (!connected) {
+          connected = true;
+          this.connectingCount = Math.max(0, (this.connectingCount || 0) - 1);
+        }
+      };
+
       const socket = tls.connect(tlsOptions, () => {
+        decrementInFlight();
         if (this.isStopping || socket.destroyed) {
           try { socket.destroy(); } catch (_) {}
           return;
         }
 
         socket.setNoDelay(true);
-        socket.setKeepAlive(true, 15000);
+        socket.setKeepAlive(true, 10000);
         socket.setMaxListeners(30);
 
-        // Pre-cache TLS session ticket
+        // Pre-cache TLS session ticket with 25s proactive rotation (well ahead of NAT drops)
         const idleTimer = setTimeout(() => {
           this.removeWarmSocket(socket);
           try { socket.destroy(); } catch (_) {}
           if (!this.isStopping) {
             this.replenishWarmPool(tlsOptions);
           }
-        }, 45000);
+        }, 25000);
 
         const warmItem = { socket, createdAt: Date.now(), idleTimer };
         this.warmSockets.push(warmItem);
@@ -94,16 +111,27 @@ class WarmPoolManager {
       });
 
       socket.on('error', () => {
+        decrementInFlight();
+        this.removeWarmSocket(socket);
+        this.activeSockets.delete(socket);
+        try { socket.destroy(); } catch (_) {}
+      });
+
+      socket.on('end', () => {
+        decrementInFlight();
         this.removeWarmSocket(socket);
         this.activeSockets.delete(socket);
         try { socket.destroy(); } catch (_) {}
       });
 
       socket.on('close', () => {
+        decrementInFlight();
         this.removeWarmSocket(socket);
         this.activeSockets.delete(socket);
       });
-    } catch (_) {}
+    } catch (_) {
+      this.connectingCount = Math.max(0, (this.connectingCount || 0) - 1);
+    }
   }
 
   removeWarmSocket(socket) {

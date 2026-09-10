@@ -59,7 +59,7 @@ class HttpsForwardProxyServer {
       : this.hardwareProfile.optimalMaxWarmSockets;
 
     this.maxWarmSockets = configuredMaxWarm;
-    this.minWarmSockets = options.minWarmSockets || Math.min(2, configuredMaxWarm);
+    this.minWarmSockets = options.minWarmSockets || (configuredMaxWarm >= 12 ? 4 : Math.min(2, configuredMaxWarm));
 
     this.warmPool = new WarmPoolManager({
       enableConnectionPool: this.enableConnectionPool,
@@ -140,8 +140,8 @@ class HttpsForwardProxyServer {
     return null;
   }
 
-  loadConfig() {
-    if (this.upstreamConfig && !this.configPath) {
+  loadConfig(force = false) {
+    if (this.upstreamConfig && !this.configPath && !force) {
       return this.upstreamConfig;
     }
     const resolvedPath = this.resolveConfigPath();
@@ -175,7 +175,7 @@ class HttpsForwardProxyServer {
           reloadTimeout = setTimeout(() => {
             try {
               const oldConfig = JSON.stringify(this.upstreamConfig);
-              this.loadConfig();
+              this.loadConfig(true);
               if (JSON.stringify(this.upstreamConfig) !== oldConfig) {
                 this.warmPool.clear();
                 this.warmPool.isStopping = false;
@@ -200,6 +200,10 @@ class HttpsForwardProxyServer {
     this.loadConfig();
     return new Promise((resolve, reject) => {
       this.server = http.createServer((req, res) => this.handleHttpRequest(req, res));
+      this.server.on('connection', (socket) => {
+        socket.setNoDelay(true);
+        socket.setKeepAlive(true, 15000);
+      });
       this.server.on('connect', (req, clientSocket, head) => this.handleConnectRequest(req, clientSocket, head));
       this.server.on('upgrade', (req, clientSocket, head) => this.handleUpgradeRequest(req, clientSocket, head));
       this.server.on('error', (err) => {

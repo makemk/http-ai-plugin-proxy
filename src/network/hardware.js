@@ -13,14 +13,14 @@ function detectHardwareProfile() {
   // Saturated threadpool: 1:1 mapping with detected cores (e.g. 20 on Core Ultra 7 265)
   const optimalThreadPool = cpuCount;
 
-  // Scale warm connection pool dynamically based on CPU core class
+  // Scale warm connection pool dynamically based on CPU core class & high-concurrency browser needs
   let optimalMaxWarmSockets = 4;
   if (cpuCount >= 16) {
-    optimalMaxWarmSockets = 6;
+    optimalMaxWarmSockets = 16;
   } else if (cpuCount >= 8) {
-    optimalMaxWarmSockets = 4;
+    optimalMaxWarmSockets = 12;
   } else {
-    optimalMaxWarmSockets = 2;
+    optimalMaxWarmSockets = 6;
   }
 
   return {

@@ -2,11 +2,15 @@
   "name": "http-ai-plugin-proxy",
   "displayName": "HTTP AI 插件代理",
   "description": "专为 Claude Code、Cline 及各类 AI 扩展设计的高性能安全 HTTP/HTTPS 代理网关",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "publisher": "local",
   "icon": "icon.png",
   "engines": {
     "vscode": "^1.80.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/makemk/http-ai-plugin-proxy.git"
   },
   "scripts": {
     "check": "node check-status.js",
