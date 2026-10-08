@@ -112,6 +112,60 @@ module.exports = {
   isDomesticBypass,
   isCustomBypass,
   isDirectBypass,
-  cleanHost
+  cleanHost,
+  buildRoutingMatcher
 };
+
+/**
+ * Precompiled routing matcher.
+ * Replaces the per-request suffix loops in the hot path with RegExps compiled
+ * once at startup (or when bypass options change). Callers must pass hosts
+ * already normalized with cleanHost().
+ */
+function escapeRegExp(s) {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function buildRoutingMatcher(options = {}) {
+  const bypassDomestic = options.bypassDomesticDomains !== undefined ? options.bypassDomesticDomains : true;
+  const customList = Array.isArray(options.customBypassList) ? options.customBypassList : [];
+
+  const aiRe = new RegExp(`(?:^|\\.)(?:${AI_DOMAINS.map(escapeRegExp).join('|')})$`);
+
+  const domesticBases = bypassDomestic ? DOMESTIC_SUFFIXES.map((s) => s.replace(/^\./, '')) : [];
+  const domesticRe = domesticBases.length
+    ? new RegExp(`(?:^|\\.)(?:${domesticBases.map(escapeRegExp).join('|')})$`)
+    : null;
+
+  const vscodeRe = /(?:^|\.)(?:vscode-cdn\.net|vscode-webview\.net|vscode-unpkg\.net|vscode-resource\.vscode-cdn\.net)$/;
+
+  const customParts = [];
+  for (const pattern of customList) {
+    const p = String(pattern).toLowerCase().trim();
+    if (!p) continue;
+    if (p.startsWith('*.')) {
+      customParts.push(`(?:^|\\.)${escapeRegExp(p.slice(2))}`);
+    } else {
+      customParts.push(`^${escapeRegExp(p)}$`);
+    }
+  }
+  const customRe = customParts.length ? new RegExp(customParts.join('|')) : null;
+
+  const isLoop = (h) => h === 'localhost' || h === '127.0.0.1' || h === '::1' || h === '0.0.0.0';
+
+  return {
+    isAi: (h) => aiRe.test(h),
+    isDomestic: (h) => (domesticRe ? domesticRe.test(h) : false),
+    isCustom: (h) => (customRe ? customRe.test(h) : false),
+    isLoopback: isLoop,
+    isDirectBypass: (h) => {
+      if (isLoop(h)) return true;
+      if (h === 'vscode-file' || h === 'vscode-app') return true;
+      if (vscodeRe.test(h)) return true;
+      if (domesticRe && domesticRe.test(h)) return true;
+      if (customRe && customRe.test(h)) return true;
+      return false;
+    }
+  };
+}
 

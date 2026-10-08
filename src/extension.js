@@ -123,6 +123,7 @@ async function startProxy(showNotification = false) {
       caCertPath: extConfig.caCertPath,
       credentialsOverride: storedCreds,
       enableConnectionPool: extConfig.enableConnectionPool,
+      enableH2Multiplex: extConfig.enableH2Multiplex,
       threadPoolSize: extConfig.threadPoolSize,
       maxWarmSockets: extConfig.maxWarmSockets,
       bypassDomesticDomains: extConfig.bypassDomesticDomains,

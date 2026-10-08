@@ -2,7 +2,7 @@
   "name": "http-ai-plugin-proxy",
   "displayName": "HTTP AI 插件代理",
   "description": "专为 Claude Code、Cline 及各类 AI 扩展设计的高性能安全 HTTP/HTTPS 代理网关",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "publisher": "local",
   "icon": "icon.png",
   "engines": {
@@ -111,14 +111,19 @@
           "default": true,
           "description": "自动配置 VS Code 全局 http.proxy 与集成终端环境变量。"
         },
+        "httpAiProxy.enableH2Multiplex": {
+          "type": "boolean",
+          "default": true,
+          "description": "启用 HTTP/2 多路复用上游隧道（网关需支持 H2，如 browser-gateway-h2）。一个常驻 H2 会话承载所有隧道，消除每请求的 CONNECT 往返；失败时自动回退到 HTTP/1.1。"
+        },
         "httpAiProxy.tlsMinVersion": {
           "type": "string",
           "enum": [
             "TLSv1.2",
             "TLSv1.3"
           ],
-          "default": "TLSv1.2",
-          "description": "上游 HTTPS 网关连接的最低 TLS 协议版本（推荐 TLS 1.3）。"
+          "default": "TLSv1.3",
+          "description": "上游 HTTPS 网关连接的最低 TLS 协议版本（默认 TLS 1.3：握手少一次往返，冷连接更快）。"
         },
         "httpAiProxy.rejectUnauthorized": {
           "type": "boolean",

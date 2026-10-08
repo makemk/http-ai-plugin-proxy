@@ -6,13 +6,15 @@ const { pipeline } = require('stream');
  */
 function bridgeSockets(clientSocket, remoteSocket, onClosed, isAi = false, activeSockets = null) {
   try {
-    clientSocket.setNoDelay(true);
-    remoteSocket.setNoDelay(true);
+    // Feature-check: H2 CONNECT streams are Duplex streams without socket
+    // tuning methods — the try/catch + guards keep both paths working.
+    if (typeof clientSocket.setNoDelay === 'function') clientSocket.setNoDelay(true);
+    if (typeof remoteSocket.setNoDelay === 'function') remoteSocket.setNoDelay(true);
 
     // AI Streaming Optimization: 3-second aggressive keep-alive protects Claude/o3 deep thinking pauses
     const keepAliveInterval = isAi ? 3000 : 15000;
-    clientSocket.setKeepAlive(true, keepAliveInterval);
-    remoteSocket.setKeepAlive(true, keepAliveInterval);
+    if (typeof clientSocket.setKeepAlive === 'function') clientSocket.setKeepAlive(true, keepAliveInterval);
+    if (typeof remoteSocket.setKeepAlive === 'function') remoteSocket.setKeepAlive(true, keepAliveInterval);
 
     // Hardware Optimization: Align stream buffer with 200ms BDP & 30MB L3 cache (256KB buffer)
     if (clientSocket._readableState) clientSocket._readableState.highWaterMark = 256 * 1024;

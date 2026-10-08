@@ -10,8 +10,9 @@ const { pipeline } = require('stream');
 const { maskHost } = require('../utils/mask');
 const { detectHardwareProfile } = require('../network/hardware');
 const { FastDnsCache } = require('../network/dns-cache');
-const { isLoopback, isAiDomain, isDirectBypass } = require('../network/domain-matcher');
+const { cleanHost, buildRoutingMatcher } = require('../network/domain-matcher');
 const { WarmPoolManager } = require('./warm-pool');
+const { H2SessionPool } = require('./h2-pool');
 const { bridgeSockets } = require('./tunnel-bridge');
 const { handleTunnelWithFailover } = require('./failover');
 
@@ -22,7 +23,7 @@ class HttpsForwardProxyServer {
     this.port = options.port !== undefined ? options.port : 18889;
     this.host = options.host || '127.0.0.1';
     this.logger = options.logger || console;
-    this.tlsMinVersion = options.tlsMinVersion || 'TLSv1.2';
+    this.tlsMinVersion = options.tlsMinVersion || 'TLSv1.3';
     this.rejectUnauthorized = options.rejectUnauthorized !== undefined ? options.rejectUnauthorized : false;
     this.caCertPath = options.caCertPath || null;
     this.credentialsOverride = options.credentialsOverride || null;
@@ -40,12 +41,24 @@ class HttpsForwardProxyServer {
       errors: 0,
       aiTunnels: 0,
       autoHeals: 0,
+      h2Tunnels: 0,
+      h2Fallbacks: 0,
       startTime: null
     };
 
     this.enableConnectionPool = options.enableConnectionPool !== undefined ? options.enableConnectionPool : true;
     this.bypassDomesticDomains = options.bypassDomesticDomains !== undefined ? options.bypassDomesticDomains : true;
     this.customBypassList = Array.isArray(options.customBypassList) ? options.customBypassList : [];
+    // H2 multiplex: the gateway speaks HTTP/2 — one persistent H2 session
+    // carries all tunnels as streams, killing the per-request CONNECT RTT.
+    this.enableH2Multiplex = options.enableH2Multiplex !== undefined ? options.enableH2Multiplex : true;
+
+    // Perf: compile domain routing RegExps once instead of looping suffix
+    // lists on every request (hot path).
+    this.routingMatcher = buildRoutingMatcher({
+      bypassDomesticDomains: this.bypassDomesticDomains,
+      customBypassList: this.customBypassList
+    });
 
     this.hardwareProfile = detectHardwareProfile();
     const configuredThreads = options.threadPoolSize && options.threadPoolSize > 0
@@ -71,6 +84,16 @@ class HttpsForwardProxyServer {
 
     this.dnsCache = new FastDnsCache();
     this.isStopping = false;
+
+    if (this.enableH2Multiplex) {
+      this.h2Pool = new H2SessionPool({
+        tlsOptionsFactory: () => this.getH2TlsOptions(),
+        authHeaderFactory: () => this.getAuthHeader(),
+        logger: this.logger,
+      });
+    } else {
+      this.h2Pool = null;
+    }
   }
 
   get warmSockets() {
@@ -78,49 +101,51 @@ class HttpsForwardProxyServer {
   }
 
   isAiDomain(host) {
-    return isAiDomain(host);
+    return this.routingMatcher.isAi(cleanHost(host));
   }
 
   isLoopback(host) {
-    return isLoopback(host);
+    return this.routingMatcher.isLoopback(cleanHost(host));
   }
 
   isDirectBypass(host) {
-    return isDirectBypass(host, {
-      bypassDomesticDomains: this.bypassDomesticDomains,
-      customBypassList: this.customBypassList
-    });
+    return this.routingMatcher.isDirectBypass(cleanHost(host));
   }
 
   getTlsOptions() {
-    const opts = {
-      host: this.upstreamConfig.host,
-      port: this.upstreamConfig.port,
-      minVersion: this.tlsMinVersion || 'TLSv1.2',
-      rejectUnauthorized: Boolean(this.rejectUnauthorized),
-      ciphers: [
-        'TLS_AES_128_GCM_SHA256',
-        'TLS_AES_256_GCM_SHA384',
-        'ECDHE-ECDSA-AES128-GCM-SHA256',
-        'ECDHE-RSA-AES128-GCM-SHA256',
-        'ECDHE-ECDSA-AES256-GCM-SHA384',
-        'ECDHE-RSA-AES256-GCM-SHA384'
-      ].join(':'),
-      honorCipherOrder: true
-    };
+    // Perf: TLS options (incl. CA cert file) are built once and cached;
+    // only the resumption session varies per call. Invalidated on reload.
+    if (!this._tlsOptions) {
+      const opts = {
+        host: this.upstreamConfig.host,
+        port: this.upstreamConfig.port,
+        minVersion: this.tlsMinVersion || 'TLSv1.3',
+        rejectUnauthorized: Boolean(this.rejectUnauthorized),
+        ciphers: [
+          'TLS_AES_128_GCM_SHA256',
+          'TLS_AES_256_GCM_SHA384',
+          'ECDHE-ECDSA-AES128-GCM-SHA256',
+          'ECDHE-RSA-AES128-GCM-SHA256',
+          'ECDHE-ECDSA-AES256-GCM-SHA384',
+          'ECDHE-RSA-AES256-GCM-SHA384'
+        ].join(':'),
+        honorCipherOrder: true
+      };
 
-    if (this.caCertPath && fs.existsSync(this.caCertPath)) {
-      try {
-        opts.ca = fs.readFileSync(this.caCertPath);
-      } catch (err) {
-        this.logger.error?.(`[CA Cert Error] Failed to load CA certificate from ${this.caCertPath}: ${err.message}`);
+      if (this.caCertPath && fs.existsSync(this.caCertPath)) {
+        try {
+          opts.ca = fs.readFileSync(this.caCertPath);
+        } catch (err) {
+          this.logger.error?.(`[CA Cert Error] Failed to load CA certificate from ${this.caCertPath}: ${err.message}`);
+        }
       }
+      this._tlsOptions = opts;
     }
 
+    const opts = Object.assign({}, this._tlsOptions);
     if (this.warmPool.tlsSession) {
       opts.session = this.warmPool.tlsSession;
     }
-
     return opts;
   }
 
@@ -158,6 +183,7 @@ class HttpsForwardProxyServer {
         username: this.credentialsOverride?.username || serverConfig.username || serverConfig.user || 'gateway',
         password: this.credentialsOverride?.password || serverConfig.password || serverConfig.pass || ''
       };
+      this._invalidateCaches();
       return this.upstreamConfig;
     } catch (err) {
       throw new Error(`Failed to parse gateway config file: ${err.message}`);
@@ -180,6 +206,9 @@ class HttpsForwardProxyServer {
                 this.warmPool.clear();
                 this.warmPool.isStopping = false;
                 this.warmPool.replenishWarmPool(this.getTlsOptions(), this.stats.activeRequests);
+                if (this.h2Pool) {
+                  this.h2Pool.reset();
+                }
                 if (typeof this.onConfigReload === 'function') {
                   this.onConfigReload(this.upstreamConfig);
                 }
@@ -192,14 +221,46 @@ class HttpsForwardProxyServer {
   }
 
   getAuthHeader() {
-    const cfg = this.upstreamConfig || this.loadConfig();
-    return 'Basic ' + Buffer.from(`${cfg.username}:${cfg.password}`).toString('base64');
+    // Perf: base64 auth header is computed once per config instead of per request.
+    if (!this._authHeader) {
+      const cfg = this.upstreamConfig || this.loadConfig();
+      this._authHeader = 'Basic ' + Buffer.from(`${cfg.username}:${cfg.password}`).toString('base64');
+    }
+    return this._authHeader;
+  }
+
+  _invalidateCaches() {
+    this._authHeader = null;
+    this._tlsOptions = null;
+    this._h2TlsOptions = null;
+  }
+
+  /**
+   * TLS options for the H2 session pool: same as the H1 options but forces
+   * ALPN h2. Kept separate because the H1 path relies on the HTTP/1.1
+   * fallback when no ALPN is negotiated.
+   */
+  getH2TlsOptions() {
+    if (!this._h2TlsOptions) {
+      const base = this.getTlsOptions();
+      const opts = Object.assign({}, base, { ALPNProtocols: ['h2'] });
+      delete opts.session;
+      this._h2TlsOptions = opts;
+    }
+    const opts = Object.assign({}, this._h2TlsOptions);
+    if (this.h2Pool && this.h2Pool.tlsSession) {
+      opts.session = this.h2Pool.tlsSession;
+    }
+    return opts;
   }
 
   async start() {
     this.loadConfig();
     return new Promise((resolve, reject) => {
       this.server = http.createServer((req, res) => this.handleHttpRequest(req, res));
+      // Keep client keep-alive connections around longer: fewer local TCP
+      // handshakes for the chatty AI-tool request pattern (default is 5s).
+      this.server.keepAliveTimeout = 30000;
       this.server.on('connection', (socket) => {
         socket.setNoDelay(true);
         socket.setKeepAlive(true, 15000);
@@ -231,6 +292,9 @@ class HttpsForwardProxyServer {
     if (this.warmPool) {
       this.warmPool.clear();
     }
+    if (this.h2Pool) {
+      this.h2Pool.close();
+    }
     return new Promise((resolve) => {
       if (this.fileWatcher) {
         try { this.fileWatcher.close(); } catch (_) {}
@@ -251,8 +315,31 @@ class HttpsForwardProxyServer {
     });
   }
 
-  parseDestination(req) {
-    let targetHost = '';
+  /**
+   * Build the raw HTTP/1.1 request head forwarded through the upstream tunnel.
+   * Shared by the H1 and H2 upstream paths.
+   */
+  buildRawRequestHead(req, targetHost, targetPort, targetPath) {
+    const cleanHeaders = { ...req.headers };
+    delete cleanHeaders['proxy-authorization'];
+    delete cleanHeaders['proxy-connection'];
+    if (!cleanHeaders['host']) {
+      cleanHeaders['host'] = targetPort === 80 ? targetHost : `${targetHost}:${targetPort}`;
+    }
+
+    let rawHeaders = `${req.method} ${targetPath} HTTP/1.1\r\n`;
+    for (const [key, val] of Object.entries(cleanHeaders)) {
+      if (Array.isArray(val)) {
+        for (const v of val) rawHeaders += `${key}: ${v}\r\n`;
+      } else if (val !== undefined) {
+        rawHeaders += `${key}: ${val}\r\n`;
+      }
+    }
+    rawHeaders += '\r\n';
+    return rawHeaders;
+  }
+
+  parseDestination(req) {    let targetHost = '';
     let targetPort = 80;
     let targetPath = req.url;
 
@@ -314,6 +401,7 @@ class HttpsForwardProxyServer {
           maxSockets: this.maxWarmSockets,
           targetSockets: this.warmPool.getDesiredWarmPoolSize(this.stats.activeRequests)
         },
+        h2Multiplex: this.h2Pool ? this.h2Pool.getStatus() : { enabled: false },
         dnsCache: {
           enabled: true,
           cachedEntries: this.dnsCache ? this.dnsCache.cache.size : 0
@@ -387,24 +475,7 @@ class HttpsForwardProxyServer {
         localSocket.setNoDelay(true);
         localSocket.setKeepAlive(true, 15000);
 
-        const cleanHeaders = { ...req.headers };
-        delete cleanHeaders['proxy-authorization'];
-        delete cleanHeaders['proxy-connection'];
-        if (!cleanHeaders['host']) {
-          cleanHeaders['host'] = targetPort === 80 ? targetHost : `${targetHost}:${targetPort}`;
-        }
-
-        let rawHeaders = `${req.method} ${targetPath} HTTP/1.1\r\n`;
-        for (const [key, val] of Object.entries(cleanHeaders)) {
-          if (Array.isArray(val)) {
-            for (const v of val) rawHeaders += `${key}: ${v}\r\n`;
-          } else if (val !== undefined) {
-            rawHeaders += `${key}: ${val}\r\n`;
-          }
-        }
-        rawHeaders += '\r\n';
-
-        localSocket.write(rawHeaders);
+        localSocket.write(this.buildRawRequestHead(req, targetHost, targetPort, targetPath));
         req.resume();
         pipeline(req, localSocket, () => {});
         pipeline(localSocket, clientSocket, () => {
@@ -421,6 +492,34 @@ class HttpsForwardProxyServer {
         try { localSocket.destroy(); } catch (_) {}
       });
       return;
+    }
+
+    // H2 multiplexed upstream (preferred): the CONNECT HEADERS + request head
+    // go out immediately on a warm H2 stream — no per-request CONNECT RTT.
+    // Falls through to the HTTP/1.1 path on any failure.
+    if (this.h2Pool) {
+      try {
+        const rawHead = this.buildRawRequestHead(req, targetHost, targetPort, targetPath);
+        req.pause();
+        const clientSocket = res.socket;
+        this.activeSockets.add(clientSocket);
+        const tunnel = await this.h2Pool.openTunnel(targetHost, targetPort, Buffer.from(rawHead, 'latin1'));
+        this.stats.h2Tunnels++;
+        req.resume();
+        pipeline(req, tunnel, () => {});
+        pipeline(tunnel, clientSocket, () => {
+          this.activeSockets.delete(clientSocket);
+          try { clientSocket.destroy(); } catch (_) {}
+          try { tunnel.destroy(); } catch (_) {}
+        });
+        tunnel.on('error', () => {
+          try { clientSocket.destroy(); } catch (_) {}
+        });
+        return;
+      } catch (err) {
+        this.stats.h2Fallbacks++;
+        this.logger.error?.(`[H2] plain-HTTP tunnel failed for ${targetHost}:${targetPort}, H1 fallback: ${err.message}`);
+      }
     }
 
     // Connect via upstream tunnel
@@ -470,24 +569,7 @@ class HttpsForwardProxyServer {
           const statusCode = parseInt(statusLine.split(' ')[1], 10);
 
           if (statusCode >= 200 && statusCode < 300) {
-            const cleanHeaders = { ...req.headers };
-            delete cleanHeaders['proxy-authorization'];
-            delete cleanHeaders['proxy-connection'];
-            if (!cleanHeaders['host']) {
-              cleanHeaders['host'] = targetPort === 80 ? targetHost : `${targetHost}:${targetPort}`;
-            }
-
-            let rawHeaders = `${req.method} ${targetPath} HTTP/1.1\r\n`;
-            for (const [key, val] of Object.entries(cleanHeaders)) {
-              if (Array.isArray(val)) {
-                for (const v of val) rawHeaders += `${key}: ${v}\r\n`;
-              } else if (val !== undefined) {
-                rawHeaders += `${key}: ${val}\r\n`;
-              }
-            }
-            rawHeaders += '\r\n';
-
-            upstreamSocket.write(rawHeaders);
+            upstreamSocket.write(this.buildRawRequestHead(req, targetHost, targetPort, targetPath));
             req.resume();
 
             pipeline(req, upstreamSocket, () => {});
@@ -581,6 +663,26 @@ class HttpsForwardProxyServer {
     clientSocket.setNoDelay(true);
     clientSocket.setKeepAlive(true, isAi ? 3000 : 15000);
     clientSocket.pause();
+
+    // H2 multiplexed upstream (preferred): open a CONNECT stream on a warm
+    // H2 session — no per-request CONNECT round trip. The `head` bytes go
+    // out optimistically with the CONNECT HEADERS.
+    if (this.h2Pool) {
+      try {
+        const tunnel = await this.h2Pool.openTunnel(targetHost, targetPort, head && head.length ? head : null);
+        this.stats.h2Tunnels++;
+        clientSocket.write('HTTP/1.1 200 Connection Established\r\nProxy-Agent: HTTP-AI-Bridge\r\n\r\n');
+        clientSocket.resume();
+        bridgeSockets(clientSocket, tunnel, () => {
+          this.stats.activeRequests = Math.max(0, this.stats.activeRequests - 1);
+        }, isAi, this.activeSockets);
+        return;
+      } catch (err) {
+        this.stats.h2Fallbacks++;
+        this.logger.error?.(`[H2] CONNECT tunnel failed for ${targetHost}:${targetPort}, H1 fallback: ${err.message}`);
+        clientSocket.pause();
+      }
+    }
 
     handleTunnelWithFailover({
       clientSocket,

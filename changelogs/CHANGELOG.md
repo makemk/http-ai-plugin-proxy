@@ -4,6 +4,36 @@ All notable changes to the "http-ai-plugin-proxy" extension will be documented i
 
 ---
 
+## [1.2.0] - 2026-10-08
+
+### Added
+- **HTTP/2 多路复用上游隧道**：新增 `src/core/h2-pool.js`（H2SessionPool），维护 2 个常驻 H2 会话（ALPN h2），每个代理请求只开一个 extended-CONNECT stream，多路复用在同一条 TLS 连接上。CONNECT HEADERS 与请求头乐观同发， effectively 0-RTT。含会话 PING 保活、10 分钟优雅轮转、GOAWAY 处理与熔断器。
+- **新增配置 `httpAiProxy.enableH2Multiplex`**（默认 true），可一键切回纯 HTTP/1.1。
+- 健康检查新增 `h2Multiplex` 段：会话/stream 数、熔断状态、隧道统计。
+
+### Changed
+- `handleConnectRequest` 与 `handleHttpRequest` 的上游路径优先走 H2，任何失败自动回退到原有 HTTP/1.1 路径（warm pool + failover 保持不动）。
+- 本地 `keepAliveTimeout` 5s → 30s，客户端长连接复用，减少本地握手。
+- VPS 侧零改动（已实测网关接受 H2 CONNECT）。
+- 详细发行注记详见 [changelogs/v1.2.0.md](changelogs/v1.2.0.md)。
+
+---
+
+## [1.1.1] - 2026-10-08
+
+### Added
+- **路由匹配预编译**：`src/network/domain-matcher.js` 新增 `buildRoutingMatcher()`，启动时将 AI 域名、国内直连后缀、自定义规则编译为正则，替代热路径上每次请求的逐后缀循环；实测路由判断提速约 4 倍。
+
+### Fixed
+- **消除每请求重复计算**：`Proxy-Authorization` 头与 TLS 连接参数（含 CA 证书）改为按配置缓存，配置热重载时自动失效；原来每个请求/每次建连都重复做 base64 与同步文件检查。
+
+### Changed
+- **默认 TLS 1.3**：`tlsMinVersion` 默认值由 `TLSv1.2` 改为 `TLSv1.3`，冷连接握手从 2-RTT 降至 1-RTT（中美链路约省 150~200ms/次）；设置中仍可改回 1.2。
+- 预热池 25 秒空闲轮转、256KB 流缓冲对齐、30 秒延迟探测等面向旗舰 CPU 的极限低延迟调优保持原样，未做改动。
+- 详细发行注记详见 [changelogs/v1.1.1.md](changelogs/v1.1.1.md)。
+
+---
+
 ## [1.1.0] - 2026-09-10
 
 ### Added
