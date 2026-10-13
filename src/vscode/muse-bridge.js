@@ -10,6 +10,7 @@
 const vscode = require('vscode');
 const { execFile } = require('child_process');
 const fs = require('fs');
+const zlib = require('zlib');
 const WebSocket = require('ws');
 
 const SECRET_KEY = 'muse_bridge.token';
@@ -193,12 +194,19 @@ class MuseBridge {
   async onMessage(data) {
     let msg;
     try { msg = JSON.parse(data.toString()); } catch (_) { return; }
-    if (msg.type !== 'cmd' || !msg.id) return;
+    if (!msg.id) return;
+    if (msg.type === 'cmd') return this.onCmd(msg);
+    if (['read_file', 'grep_file', 'file_info', 'write_file'].includes(msg.type)) {
+      return this.onFileOp(msg);
+    }
+  }
+
+  async onCmd(msg) {
     const command = String(msg.command || '');
     const timeout = Math.min(Math.max(parseInt(msg.timeout, 10) || 120, 5), 600);
     this.log(`收到命令 [${msg.id}]: ${command.slice(0, 120)}${command.length > 120 ? '...' : ''}`);
 
-    const approved = await this.checkApproval(command);
+    const approved = await this.checkApproval(command, READONLY_RE.test(command));
     if (!approved) {
       this.log(`命令 [${msg.id}] 被用户拒绝。`);
       return this.sendResult(msg.id, -1, '', 'rejected by user');
@@ -208,14 +216,99 @@ class MuseBridge {
     this.sendResult(msg.id, res.exit, res.stdout, res.stderr);
   }
 
-  async checkApproval(command) {
+  async onFileOp(msg) {
+    const t = msg.type;
+    const p = String(msg.path || '');
+    this.log(`文件操作 [${msg.id}]: ${t} ${p.slice(0, 100)}`);
+    try {
+      if (t === 'read_file') return this.sendFileResult(msg.id, await this.doRead(p, msg));
+      if (t === 'grep_file') return this.sendFileResult(msg.id, await this.doGrep(p, msg));
+      if (t === 'file_info') return this.sendFileResult(msg.id, await this.doInfo(p));
+      if (t === 'write_file') {
+        // 写文件永远走审批(非只读)
+        const ok = await this.checkApproval(`写入文件: ${p}`, false);
+        if (!ok) {
+          this.log(`写文件 [${msg.id}] 被用户拒绝。`);
+          return this.sendFileResult(msg.id, { ok: false, error: 'rejected by user' });
+        }
+        return this.sendFileResult(msg.id, await this.doWrite(p, msg));
+      }
+    } catch (e) {
+      this.log(`文件操作 [${msg.id}] 异常: ${e.message}`);
+      this.sendFileResult(msg.id, { ok: false, error: e.message });
+    }
+  }
+
+  async doRead(p, msg) {
+    const offset = Math.max(parseInt(msg.offset, 10) || 0, 0);
+    const length = Math.min(Math.max(parseInt(msg.length, 10) || 1048576, 1), 8 * 1048576);
+    const st = await fs.promises.stat(p);
+    if (!st.isFile()) throw new Error('not a file');
+    const end = Math.min(offset + length, st.size);
+    const chunks = [];
+    if (end > offset) {
+      const stream = fs.createReadStream(p, { start: offset, end: end - 1 });
+      for await (const c of stream) chunks.push(c);
+    }
+    const raw = Buffer.concat(chunks);
+    return {
+      data: zlib.deflateSync(raw, { level: 6 }).toString('base64'),
+      compressed: true, bytes: raw.length, eof: end >= st.size,
+    };
+  }
+
+  async doGrep(p, msg) {
+    const pattern = String(msg.pattern || '');
+    const maxMatches = Math.min(Math.max(parseInt(msg.max_matches, 10) || 200, 1), 5000);
+    if (!pattern) throw new Error('empty pattern');
+    const re = new RegExp(pattern);
+    const matches = [];
+    let total = 0, lineno = 0;
+    const rl = require('readline').createInterface({
+      input: fs.createReadStream(p, { encoding: 'utf8' }),
+      crlfDelay: Infinity,
+    });
+    for await (const line of rl) {
+      lineno++;
+      if (re.test(line)) {
+        total++;
+        if (matches.length < maxMatches) matches.push({ line: lineno, text: line.slice(0, 500) });
+      }
+    }
+    return { matches, total };
+  }
+
+  async doInfo(p) {
+    const st = await fs.promises.stat(p);
+    return { size: st.size, mtime: st.mtimeMs, is_file: st.isFile() };
+  }
+
+  async doWrite(p, msg) {
+    let raw = Buffer.from(String(msg.data || ''), 'base64');
+    if (msg.compressed) raw = zlib.inflateSync(raw);
+    await fs.promises.writeFile(p, raw, { flag: msg.mode === 'a' ? 'a' : 'w' });
+    return { bytes: raw.length };
+  }
+
+  sendFileResult(id, obj) {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+      this.log(`文件结果 [${id}] 发送失败:连接已断开`);
+      return;
+    }
+    try {
+      this.ws.send(JSON.stringify({ type: 'file_result', id, ...obj }));
+    } catch (e) {
+      this.log(`文件结果 [${id}] 发送异常: ${e.message}`);
+    }
+  }
+
+  async checkApproval(display, isReadonly) {
     const mode = this.getConfig().approvalMode;
-    const isReadonly = READONLY_RE.test(command);
-    const isDangerous = DANGEROUS_RE.test(command);
+    const isDangerous = DANGEROUS_RE.test(display);
     if (mode === 'auto' && !isDangerous) return true;
     if (mode === 'confirm-dangerous' && isReadonly && !isDangerous) return true;
     const choice = await vscode.window.showWarningMessage(
-      `Muse 请求在本机执行命令:\n${command}`,
+      `Muse 请求在你电脑上执行:\n${display}`,
       { modal: true },
       '执行', '拒绝'
     );

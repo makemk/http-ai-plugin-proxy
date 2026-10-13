@@ -4,6 +4,19 @@ All notable changes to the "http-ai-plugin-proxy" extension will be documented i
 
 ---
 
+## [1.4.0] - 2026-10-14
+
+### Added
+- **Muse Bridge 文件传输**：新增四种文件操作消息，走现有 WebSocket 通道（VPS 只做哑管道转发）。
+  - `read_file`：按 offset/length 分片读（单片上限 8MB），zlib 压缩后 base64 回传。
+  - `grep_file`：远端正则 grep，只回匹配行（行号+最多 5000 条），大日志不用落地。
+  - `file_info`：大小/mtime/是否文件，先看元数据再决定怎么拿。
+  - `write_file`：base64+zlib 写入（w/a 模式），**永远走审批流**（非只读）。
+  - 压缩：Node `zlib` ↔ Python `zlib`，stdlib 对接，>4KB 自动压；文本/日志通常 5-10 倍。
+  - VPS 侧 `muse-bridge-cli` 新增 `--read/--grep/--info/--write/--download`（download 原始字节走 stdout，可断点续传式分片）。
+
+---
+
 ## [1.3.0] - 2026-10-14
 
 ### Added
