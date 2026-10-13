@@ -64,7 +64,58 @@ class MuseBridge {
       approvalMode: cfg.get('museBridge.approvalMode', 'confirm-dangerous'),
       gitBashPath: cfg.get('museBridge.gitBashPath', ''),
       vpsHost: cfg.get('museBridge.vpsHost', DEFAULT_HOST),
+      permissionsPath: cfg.get('museBridge.permissionsPath', ''),
     };
+  }
+
+  // ---- 权限配置文件: ~/.muse-bridge/permissions.json ----
+  // { "default": "allow", "deny": [] }  -> 全部放行,不弹窗
+  // deny 里加子串(不区分大小写),命中则走弹窗确认; default 改为 "deny" 则退回 approvalMode 逻辑
+  permissionsPath() {
+    const cfg = this.getConfig();
+    if (cfg.permissionsPath) return cfg.permissionsPath;
+    return require('path').join(require('os').homedir(), '.muse-bridge', 'permissions.json');
+  }
+
+  ensurePermissionsFile() {
+    const p = this.permissionsPath();
+    if (fs.existsSync(p)) return;
+    try {
+      fs.mkdirSync(require('path').dirname(p), { recursive: true });
+      fs.writeFileSync(p, JSON.stringify({
+        _comment: 'default=allow: 全部放行不弹窗; deny 加子串(不区分大小写),命中则弹窗确认; default=deny 则退回 approvalMode',
+        default: 'allow',
+        deny: [],
+      }, null, 2));
+      this.log(`已创建权限配置: ${p}`);
+    } catch (e) {
+      this.log(`创建权限配置失败: ${e.message}`);
+    }
+  }
+
+  loadPermissions() {
+    try {
+      const p = this.permissionsPath();
+      const mtime = fs.statSync(p).mtimeMs;
+      if (this._permCache && this._permCache.mtime === mtime) return this._permCache.data;
+      const data = JSON.parse(fs.readFileSync(p, 'utf8'));
+      this._permCache = { mtime, data };
+      return data;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  checkPermissionFile(display) {
+    // true=静默放行, false=走 legacy approvalMode 流程
+    const perm = this.loadPermissions();
+    if (!perm || perm.default !== 'allow') return false;
+    const deny = Array.isArray(perm.deny) ? perm.deny : [];
+    const low = String(display).toLowerCase();
+    for (const pat of deny) {
+      if (pat && low.includes(String(pat).toLowerCase())) return false;
+    }
+    return true;
   }
 
   resolveBash() {
@@ -107,6 +158,7 @@ class MuseBridge {
       return;
     }
     this.log(`使用 shell: ${bash}`);
+    this.ensurePermissionsFile();
     this.connect(token, cfg);
   }
 
@@ -303,6 +355,7 @@ class MuseBridge {
   }
 
   async checkApproval(display, isReadonly) {
+    if (this.checkPermissionFile(display)) return true; // 权限文件:默认全放行
     const mode = this.getConfig().approvalMode;
     const isDangerous = DANGEROUS_RE.test(display);
     if (mode === 'auto' && !isDangerous) return true;
