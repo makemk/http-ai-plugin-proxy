@@ -4,6 +4,19 @@ All notable changes to the "http-ai-plugin-proxy" extension will be documented i
 
 ---
 
+## [1.3.0] - 2026-10-14
+
+### Added
+- **Muse Bridge**：新增 `src/vscode/muse-bridge.js`，让 Muse 通过 VPS 上的 WebSocket 命令总线直接操控本机。
+  - 架构：本机 `--wss://VPS:9443/muse-bridge-->` nginx(TLS) `--> 127.0.0.1:8471`；纯出站长连接，本机不开放任何端口，事件驱动推送（无轮询）。
+  - 命令经 **Git Bash** 执行（`bash.exe -l -c`），执行成功率高于 PowerShell；可通过 `httpAiProxy.museBridge.gitBashPath` 自定义。
+  - 分级审批：`confirm-dangerous`（默认，只读命令自动放行、其余弹窗确认）、`confirm-all`、`auto`。
+  - Token 存于 VS Code SecretStorage（`muse_bridge.token`），不落配置文件；命令 `Muse Bridge: 设置 Token` 可视化录入。
+  - 指数退避自动重连、应用层 ping 保活、状态栏在线指示器。
+  - 新增配置 `httpAiProxy.museBridge.*`（enabled 默认 false）与三个命令（toggle/setToken/status）。
+
+---
+
 ## [1.2.0] - 2026-10-08
 
 ### Added

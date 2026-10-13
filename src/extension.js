@@ -22,6 +22,7 @@ const {
   clearSystemEnvCommand
 } = require('./vscode/commands');
 const { checkForUpdates } = require('./vscode/updater');
+const { MuseBridge } = require('./vscode/muse-bridge');
 
 const detectedHw = detectHardwareProfile();
 process.env.UV_THREADPOOL_SIZE = process.env.UV_THREADPOOL_SIZE || String(detectedHw.optimalThreadPool);
@@ -35,6 +36,7 @@ let outputChannel = null;
 let isStarting = false;
 let extensionContext = null;
 let latencyTimer = null;
+let museBridge = null;
 
 function updateStatus(status, details = '') {
   statusBar?.update(status, {
@@ -379,12 +381,42 @@ function activate(context) {
       checkForUpdates(context, true, {
         configPath: proxyServer ? proxyServer.resolveConfigPath() : getExtensionConfig().configPath
       });
+    }),
+    vscode.commands.registerCommand('museBridge.toggle', async () => {
+      const cfg = vscode.workspace.getConfiguration('httpAiProxy');
+      const cur = cfg.get('museBridge.enabled', false);
+      await cfg.update('museBridge.enabled', !cur, vscode.ConfigurationTarget.Global);
+      vscode.window.showInformationMessage(`Muse Bridge 已${!cur ? '启用' : '停用'}。`);
+    }),
+    vscode.commands.registerCommand('museBridge.setToken', async () => {
+      const token = await vscode.window.showInputBox({
+        title: 'Muse Bridge Token',
+        prompt: '请输入 Bridge Token(在 VPS 上执行 sudo cat /etc/muse-bridge/token 获取)',
+        password: true,
+        ignoreFocusOut: true,
+      });
+      if (token && token.trim()) {
+        await context.secrets.store('muse_bridge.token', token.trim());
+        outputChannel.appendLine('[MuseBridge] Token 已保存,正在重连...');
+        await museBridge?.restart();
+        vscode.window.showInformationMessage('Muse Bridge Token 已保存。');
+      }
+    }),
+    vscode.commands.registerCommand('museBridge.status', () => {
+      const enabled = vscode.workspace.getConfiguration('httpAiProxy').get('museBridge.enabled', false);
+      const online = museBridge?.ws?.readyState === 1;
+      vscode.window.showInformationMessage(
+        `Muse Bridge: ${enabled ? (online ? '在线' : '未连接') : '未启用'}`
+      );
     })
   );
 
   context.subscriptions.push(
     vscode.workspace.onDidChangeConfiguration((e) => {
-      if (e.affectsConfiguration('httpAiProxy')) {
+      if (e.affectsConfiguration('httpAiProxy.museBridge')) {
+        outputChannel.appendLine('[配置变更] 检测到 Bridge 配置变更，正在重启 Bridge...');
+        museBridge?.restart();
+      } else if (e.affectsConfiguration('httpAiProxy')) {
         outputChannel.appendLine('[配置变更] 检测到插件配置变更，正在热重启服务...');
         restartProxy();
       }
@@ -392,6 +424,10 @@ function activate(context) {
   );
 
   startProxy();
+
+  // Muse Bridge: 让 Muse 通过 VPS 命令总线直接操控本机(默认关闭)
+  museBridge = new MuseBridge(context, outputChannel);
+  museBridge.start().catch((e) => outputChannel.appendLine(`[MuseBridge] 启动异常: ${e.message}`));
 
   // Background auto check for updates (delayed 6s after VS Code starts)
   if (getExtensionConfig().autoCheckUpdates) {
@@ -404,6 +440,7 @@ function activate(context) {
 }
 
 function deactivate() {
+  try { museBridge?.stop(); } catch (_) {}
   return stopProxy();
 }
 
