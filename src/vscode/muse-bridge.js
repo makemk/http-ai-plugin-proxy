@@ -180,6 +180,7 @@ class MuseBridge {
       poolSize: cfg.get('museBridge.poolSize', POOL_SIZE),
       poolMax: cfg.get('museBridge.poolMax', POOL_MAX),
       burstIdleSeconds: cfg.get('museBridge.burstIdleSeconds', BURST_IDLE_MS / 1000),
+      bypassProxy: cfg.get('museBridge.bypassProxy', false),
     };
   }
 
@@ -335,12 +336,20 @@ class MuseBridge {
       // ("Cert does not contain a DNS name")。显式传入 servername, 让校验拿到真实 host。
       let servername;
       try { servername = new URL(url).hostname; } catch (_) { servername = undefined; }
-      ws = new WebSocket(url, {
+      // bypassProxy: 直连 VPS，不走系统代理(18889)。用原生 https.Agent，
+      // 避免 ws 库 / Node 自动拾取 HTTPS_PROXY 环境变量。
+      const wsOpts = {
         headers: { 'X-Bridge-Token': token },
         handshakeTimeout: 15000,
         ...(servername ? { servername } : {}),
         checkServerIdentity: checkServerIdentityIP,
-      });
+      };
+      if (cfg.bypassProxy) {
+        const https = require('https');
+        wsOpts.agent = new https.Agent({ keepAlive: true });
+        this.log('Bridge 直连模式: 绕过系统代理');
+      }
+      ws = new WebSocket(url, wsOpts);
     } catch (e) {
       this.log(`创建连接失败: ${e.message}`);
       return this.scheduleReconnect(token, cfg);

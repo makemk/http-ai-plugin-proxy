@@ -2,7 +2,7 @@
   "name": "http-ai-plugin-proxy",
   "displayName": "HTTP AI 插件代理",
   "description": "专为 Claude Code、Cline 及各类 AI 扩展设计的高性能安全 HTTP/HTTPS 代理网关",
-  "version": "1.3.0",
+  "version": "1.3.1",
   "publisher": "local",
   "icon": "icon.png",
   "engines": {
@@ -257,6 +257,11 @@
           "minimum": 10,
           "maximum": 600,
           "description": "Muse Bridge burst shell 空闲多少秒后回收。修改后下次执行命令时生效。"
+        },
+        "httpAiProxy.museBridge.bypassProxy": {
+          "type": "boolean",
+          "default": false,
+          "description": "Bridge 直连 VPS，不走系统代理(18889)。若直连被墙则保持关闭。"
         }
       }
     }

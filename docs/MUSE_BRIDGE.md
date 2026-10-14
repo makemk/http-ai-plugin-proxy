@@ -26,6 +26,23 @@ Muse Bridge 让 AI 助手通过 WebSocket 直接操控用户 PC（VS Code 扩展
 - Token 存 VS Code SecretStorage（`muse_bridge.token`），请求头 `X-Bridge-Token`。
 - TLS：显式 `servername` + 自定义 IP 证书校验，不关闭验证。
 
+## 网络路径
+
+默认 Bridge 经系统代理（`HTTPS_PROXY`，如 `127.0.0.1:18889`）连 VPS。
+若代理不稳，可开直连：
+
+```json
+"httpAiProxy.museBridge.bypassProxy": true
+```
+
+开启后用原生 `https.Agent` 直连 `wss://<vps>/muse-bridge`，不拾取代理环境变量。
+2026-10-14 实测：PC（10.100.85.136）直达 VPS 443 四条 ESTABLISHED 长连接，
+GFW 未拦截。若直连被墙则保持关闭。
+
+> 背景：插件曾在扩展主机内自建 18889 本地代理，Bridge 客户端经它出站。
+> 扩展主机抖动时代理先挂，Bridge 报 `Failed to establish a socket connection
+> to proxies` 后 1006 断开。v1.3.1 起支持 bypassProxy 隔离。
+
 ## 权限模型
 
 `~/.muse-bridge/permissions.json`：
