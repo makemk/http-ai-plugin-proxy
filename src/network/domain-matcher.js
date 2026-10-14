@@ -49,6 +49,39 @@ function isLoopback(host) {
   return h === 'localhost' || h === '127.0.0.1' || h === '::1' || h === '0.0.0.0';
 }
 
+function isIpv4Literal(host) {
+  return /^\d{1,3}(\.\d{1,3}){3}$/.test(host);
+}
+
+function ipv4Octets(host) {
+  const parts = host.split('.').map(Number);
+  if (parts.length !== 4 || parts.some((n) => !Number.isInteger(n) || n < 0 || n > 255)) return null;
+  return parts;
+}
+
+// RFC1918 内网段: 10/8, 172.16/12, 192.168/16 → 直连绕行 (路由器/NAS/开发板)
+function isPrivateIpv4(host) {
+  const h = cleanHost(host);
+  if (!isIpv4Literal(h)) return false;
+  const o = ipv4Octets(h);
+  if (!o) return false;
+  if (o[0] === 10) return true;
+  if (o[0] === 172 && o[1] >= 16 && o[1] <= 31) return true;
+  if (o[0] === 192 && o[1] === 168) return true;
+  return false;
+}
+
+// 不可路由: 169.254/16 (link-local, 含云元数据服务), 0/8 → 本地直接拒绝, 不转发上游
+function isNonRoutableIp(host) {
+  const h = cleanHost(host);
+  if (!isIpv4Literal(h)) return false;
+  const o = ipv4Octets(h);
+  if (!o) return false;
+  if (o[0] === 169 && o[1] === 254) return true;
+  if (o[0] === 0) return true;
+  return false;
+}
+
 function isAiDomain(host) {
   const h = cleanHost(host);
   if (!h) return false;
@@ -92,6 +125,7 @@ function isDirectBypass(host, options = {}) {
 
   return (
     isLoopback(h) ||
+    isPrivateIpv4(h) ||
     h.endsWith('.vscode-cdn.net') ||
     h.endsWith('.vscode-webview.net') ||
     h.endsWith('.vscode-unpkg.net') ||
@@ -108,6 +142,8 @@ function isDirectBypass(host, options = {}) {
 
 module.exports = {
   isLoopback,
+  isPrivateIpv4,
+  isNonRoutableIp,
   isAiDomain,
   isDomesticBypass,
   isCustomBypass,
@@ -158,8 +194,11 @@ function buildRoutingMatcher(options = {}) {
     isDomestic: (h) => (domesticRe ? domesticRe.test(h) : false),
     isCustom: (h) => (customRe ? customRe.test(h) : false),
     isLoopback: isLoop,
+    isPrivateIpv4: (h) => isPrivateIpv4(h),
+    isNonRoutableIp: (h) => isNonRoutableIp(h),
     isDirectBypass: (h) => {
       if (isLoop(h)) return true;
+      if (isPrivateIpv4(h)) return true;
       if (h === 'vscode-file' || h === 'vscode-app') return true;
       if (vscodeRe.test(h)) return true;
       if (domesticRe && domesticRe.test(h)) return true;

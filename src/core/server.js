@@ -112,6 +112,10 @@ class HttpsForwardProxyServer {
     return this.routingMatcher.isDirectBypass(cleanHost(host));
   }
 
+  isNonRoutable(host) {
+    return this.routingMatcher.isNonRoutableIp(cleanHost(host));
+  }
+
   getTlsOptions() {
     // Perf: TLS options (incl. CA cert file) are built once and cached;
     // only the resumption session varies per call. Invalidated on reload.
@@ -461,6 +465,13 @@ class HttpsForwardProxyServer {
       return;
     }
 
+    // 不可路由 IP (169.254/16 link-local、0/8): 本地直接拒绝, 不转发上游 (防 SSRF 探针打到 VPS 元数据)
+    if (this.isNonRoutable(targetHost)) {
+      res.writeHead(403, { 'Content-Type': 'text/plain', 'X-Content-Type-Options': 'nosniff' });
+      res.end('403 Forbidden: non-public IP not forwarded');
+      return;
+    }
+
     if (this.isDirectBypass(targetHost)) {
       req.pause();
       const clientSocket = res.socket;
@@ -497,6 +508,7 @@ class HttpsForwardProxyServer {
     // H2 multiplexed upstream (preferred): the CONNECT HEADERS + request head
     // go out immediately on a warm H2 stream — no per-request CONNECT RTT.
     // Falls through to the HTTP/1.1 path on any failure.
+    let h2Failed = false;
     if (this.h2Pool) {
       try {
         const rawHead = this.buildRawRequestHead(req, targetHost, targetPort, targetPath);
@@ -518,7 +530,8 @@ class HttpsForwardProxyServer {
         return;
       } catch (err) {
         this.stats.h2Fallbacks++;
-        this.logger.error?.(`[H2] plain-HTTP tunnel failed for ${targetHost}:${targetPort}, H1 fallback: ${err.message}`);
+        h2Failed = true;
+        this.logger.warn?.(`[H2] plain-HTTP tunnel failed for ${targetHost}:${targetPort} (${err.message}), trying H1 fallback`);
       }
     }
 
@@ -569,6 +582,7 @@ class HttpsForwardProxyServer {
           const statusCode = parseInt(statusLine.split(' ')[1], 10);
 
           if (statusCode >= 200 && statusCode < 300) {
+            if (h2Failed) this.logger.info?.(`[H1] fallback succeeded for ${targetHost}:${targetPort}`);
             upstreamSocket.write(this.buildRawRequestHead(req, targetHost, targetPort, targetPath));
             req.resume();
 
@@ -580,6 +594,7 @@ class HttpsForwardProxyServer {
               try { upstreamSocket.destroy(); } catch (_) {}
             });
           } else {
+            if (h2Failed) this.logger.warn?.(`[H1] fallback failed for ${targetHost}:${targetPort}: upstream returned ${statusLine}`);
             res.writeHead(502, { 'Content-Type': 'text/plain' });
             res.end(`502 Bad Gateway: Upstream returned ${statusLine}`);
             try { clientSocket.destroy(); } catch (_) {}
@@ -590,7 +605,8 @@ class HttpsForwardProxyServer {
     };
 
     upstreamSocket.on('data', onUpstreamData);
-    upstreamSocket.on('error', () => {
+    upstreamSocket.on('error', (err) => {
+      if (h2Failed) this.logger.warn?.(`[H1] fallback failed for ${targetHost}:${targetPort}: ${err.message}`);
       try { clientSocket.destroy(); } catch (_) {}
       try { upstreamSocket.destroy(); } catch (_) {}
     });
@@ -609,6 +625,16 @@ class HttpsForwardProxyServer {
       const lastColon = req.url.lastIndexOf(':');
       targetHost = req.url.slice(0, lastColon);
       targetPort = parseInt(req.url.slice(lastColon + 1), 10) || 443;
+    }
+
+    // 不可路由 IP (169.254/16 link-local、0/8): 本地直接拒绝, 不转发上游
+    if (this.isNonRoutable(targetHost)) {
+      try {
+        clientSocket.write('HTTP/1.1 403 Forbidden\r\nContent-Type: text/plain\r\n\r\n403 Forbidden: non-public IP not forwarded');
+      } catch (_) {}
+      try { clientSocket.destroy(); } catch (_) {}
+      this.stats.activeRequests = Math.max(0, this.stats.activeRequests - 1);
+      return;
     }
 
     // Direct local / domestic bypass
@@ -679,7 +705,7 @@ class HttpsForwardProxyServer {
         return;
       } catch (err) {
         this.stats.h2Fallbacks++;
-        this.logger.error?.(`[H2] CONNECT tunnel failed for ${targetHost}:${targetPort}, H1 fallback: ${err.message}`);
+        this.logger.warn?.(`[H2] CONNECT tunnel failed for ${targetHost}:${targetPort} (${err.message}), trying H1 fallback`);
         clientSocket.pause();
       }
     }
