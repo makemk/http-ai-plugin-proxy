@@ -211,7 +211,7 @@
         "httpAiProxy.museBridge.gitBashPath": {
           "type": "string",
           "default": "",
-          "description": "Git Bash 路径(留空则自动探测 C:\\Program Files\\Git\\bin\\bash.exe)。"
+          "description": "Git Bash 路径(留空则自动探测:优先 %USERPROFILE%\\git\\bin\\sh.exe, 再找 Program Files 下的 Git)。"
         },
         "httpAiProxy.museBridge.vpsHost": {
           "type": "string",

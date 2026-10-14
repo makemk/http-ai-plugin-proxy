@@ -4,6 +4,20 @@ All notable changes to the "http-ai-plugin-proxy" extension will be documented i
 
 ---
 
+## [1.2.1] - 2026-10-14
+
+### Added
+- **Muse Bridge**：让 Muse 通过 VPS 上的 WebSocket 命令总线直接操控本机（WSS 长连接，事件驱动推送，无轮询；命令与文件传输详见下方 1.3.0/1.4.0 内部开发记录）。
+- 权限配置文件 `~/.muse-bridge/permissions.json`：首次运行自动创建，默认 `{"default":"allow","deny":[]}` 全放行不弹窗；`deny` 里加子串命中则弹窗确认。
+- Bridge 命令集成进代理控制菜单（`Muse Bridge` 分隔线 + 启用/停用/设置 Token/查看连接状态）。
+
+### Fixed
+- **Git Bash 探测（用户本机实测）**：Git 为便携安装，位于 `%USERPROFILE%\git`，入口是 `sh.exe`；探测顺序改为优先 `%USERPROFILE%\git\bin\sh.exe`，再找 Program Files。**绝不用 PATH 裸 `bash`/`sh`**（本机 `bash` → WSL，`sh` → Git Bash）。
+- Bridge 审查修复：`file_result` 的 `ok:false` 不再被覆盖；`/result` 等待时长跟随命令 timeout；`--write` 改流式上传；`int()` 安全解析。
+- Bridge 默认走 443：nginx stream 按 ALPN 分流（`h2` → browser-gateway，`无 ALPN` → bridge），与原有隧道同端口。
+
+---
+
 ## [1.4.0] - 2026-10-14
 
 ### Added

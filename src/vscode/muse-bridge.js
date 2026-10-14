@@ -10,15 +10,28 @@
 const vscode = require('vscode');
 const { execFile } = require('child_process');
 const fs = require('fs');
+const path = require('path');
 const zlib = require('zlib');
 const WebSocket = require('ws');
 
 const SECRET_KEY = 'muse_bridge.token';
 const DEFAULT_HOST = '38.207.167.51'; // 443: 与 browser-gateway 同端口,经 nginx ALPN 分流
-const GIT_BASH_CANDIDATES = [
-  'C:\\Program Files\\Git\\bin\\bash.exe',
-  'C:\\Program Files (x86)\\Git\\bin\\bash.exe',
-];
+
+// Git Bash 候选 (按用户本机 AGENTS.md §1):
+// - 绝不要用 PATH 上的裸 bash/sh: 本机 bash -> WSL (C:\windows\system32\bash.exe), sh -> Git Bash
+// - 用户本机 Git 是便携安装, 在 %USERPROFILE%\git, 入口是 sh.exe
+// - 统一用绝对路径 + existsSync 探测, 避免 WSL 陷阱
+function gitBashCandidates() {
+  const userProfile = process.env.USERPROFILE || require('os').homedir();
+  return [
+    path.join(userProfile, 'git', 'bin', 'sh.exe'),   // 便携安装 (用户本机, AGENTS.md §1.1)
+    path.join(userProfile, 'git', 'bin', 'bash.exe'),
+    'C:\\Program Files\\Git\\bin\\sh.exe',
+    'C:\\Program Files\\Git\\bin\\bash.exe',
+    'C:\\Program Files (x86)\\Git\\bin\\sh.exe',
+    'C:\\Program Files (x86)\\Git\\bin\\bash.exe',
+  ];
+}
 
 // 只读命令:自动放行(大小写不敏感,允许前导空白)
 const READONLY_RE = /^\s*(echo|ls|dir|cat|type|pwd|cd|whoami|hostname|uname|df|du|ps|find|grep|head|tail|wc|sort|uniq|git\s+(status|log|diff|branch|remote)|node\s+--version|python3?\s+--version|where|which)\b/i;
@@ -121,7 +134,7 @@ class MuseBridge {
   resolveBash() {
     const cfg = this.getConfig();
     if (cfg.gitBashPath && fs.existsSync(cfg.gitBashPath)) return cfg.gitBashPath;
-    for (const p of GIT_BASH_CANDIDATES) {
+    for (const p of gitBashCandidates()) {
       if (fs.existsSync(p)) return p;
     }
     return null;
