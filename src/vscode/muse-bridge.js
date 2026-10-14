@@ -336,7 +336,10 @@ class MuseBridge {
     this.ws = ws;
 
     ws.on('open', () => {
-      this.reconnectDelay = 2000;
+      const openedAt = Date.now();
+      // 只有稳定在线超 30s 才重置 backoff; 刚连上就掉线(抖动期)不重置, 避免紧循环 hammer
+      const prevDelay = this.reconnectDelay;
+      this._openAt = openedAt;
       this.setStatus('online');
       this.log('Bridge 已上线,等待 Muse 的命令。');
       ws.send(JSON.stringify({
@@ -344,12 +347,19 @@ class MuseBridge {
         client: `http-ai-plugin-proxy/${this.context.extension.packageJSON.version}`,
         hostname: require('os').hostname(),
       }));
+      // 出生 30s 后若还活着, 重置 backoff
+      setTimeout(() => {
+        if (this.ws === ws && ws.readyState === WebSocket.OPEN) {
+          this.reconnectDelay = 2000;
+        }
+      }, 30000);
     });
 
     ws.on('message', (data) => this.onMessage(data).catch((e) => this.log(`处理消息异常: ${e.message}`)));
 
     ws.on('close', (code) => {
       if (this.ws === ws) this.ws = null;
+      try { clearTimeout(pongTimer); } catch (_) {}
       this.setStatus('error', `连接断开 (${code})`);
       this.log(`连接断开 (code=${code}),准备重连...`);
       this.scheduleReconnect(token, cfg);
@@ -359,20 +369,42 @@ class MuseBridge {
       this.log(`连接错误: ${e.message}`);
     });
 
-    // 应用层 ping 保活(穿过 nginx 长超时)
+    // 应用层心跳: ping -> pong, 连续 2 次无 pong 则判定半开死亡, 主动 terminate 触发重连。
+    // (之前只发 ping 不收 pong, 半开连接要等 OS 超时(分钟级)才发现。)
+    let pongMissed = 0;
+    let pongTimer = null;
     const pingTimer = setInterval(() => {
-      if (ws.readyState === WebSocket.OPEN) {
-        try { ws.ping(); } catch (_) {}
-      } else {
+      if (ws.readyState !== WebSocket.OPEN) {
         clearInterval(pingTimer);
+        if (pongTimer) clearTimeout(pongTimer);
+        return;
       }
-    }, 25000);
+      try { ws.ping(); } catch (_) { return; }
+      // 单次 pong 超时 10s
+      if (pongTimer) clearTimeout(pongTimer);
+      pongTimer = setTimeout(() => {
+        pongMissed++;
+        this.log(`ping 无 pong (${pongMissed}/2)`);
+        if (pongMissed >= 2) {
+          this.log('连续 2 次 ping 无 pong, 判定连接已死, 主动断开重连');
+          clearInterval(pingTimer);
+          try { ws.terminate(); } catch (_) {}
+        }
+      }, 10000);
+    }, 20000);
+    ws.on('pong', () => {
+      pongMissed = 0;
+      if (pongTimer) { clearTimeout(pongTimer); pongTimer = null; }
+    });
   }
 
   scheduleReconnect(token, cfg) {
     if (this.stopping) return;
     if (this.reconnectTimer) return;
-    const delay = Math.min(this.reconnectDelay, 60000);
+    // backoff + 抖动 (±25%), 防多客户端同时重连惊群
+    const base = Math.min(this.reconnectDelay, 60000);
+    const jitter = base * (0.75 + Math.random() * 0.5);
+    const delay = Math.floor(jitter);
     this.log(`${(delay / 1000).toFixed(0)}s 后重连...`);
     this.reconnectTimer = setTimeout(() => {
       this.reconnectTimer = null;
