@@ -10,6 +10,7 @@ All notable changes to the "http-ai-plugin-proxy" extension will be documented i
 - **Muse Bridge**：让 Muse 通过 VPS 上的 WebSocket 命令总线直接操控本机（WSS 长连接，事件驱动推送，无轮询；命令与文件传输详见下方 1.3.0/1.4.0 内部开发记录）。
 - 权限配置文件 `~/.muse-bridge/permissions.json`：首次运行自动创建，默认 `{"default":"allow","deny":[]}` 全放行不弹窗；`deny` 里加子串命中则弹窗确认。
 - Bridge 命令集成进代理控制菜单（`Muse Bridge` 分隔线 + 启用/停用/设置 Token/查看连接状态）。
+- Bridge JSON 查询（`json_query` / `musepc --jq <path> <filter>`）：运行时先探测 jq，有则走 jq（filter 写临时文件，写文件→跑文件），无则回退 Python 子集（`.` / `.a.b` / `.a[0]` / `.length` / `.keys`，超出子集报错）。
 
 ### Fixed
 - **Git Bash 探测（用户本机实测）**：Git 为便携安装，位于 `%USERPROFILE%\git`，入口是 `sh.exe`；探测顺序改为优先 `%USERPROFILE%\git\bin\sh.exe`，再找 Program Files。**绝不用 PATH 裸 `bash`/`sh`**（本机 `bash` → WSL，`sh` → Git Bash）。
