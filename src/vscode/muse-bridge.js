@@ -143,6 +143,8 @@ class MuseBridge {
     this.stopping = false;
     this._bgJobs = new Map();
     this._bgSeq = 0;
+    this._watches = new Map(); // watch_id -> { watcher, path, keywords, pos }
+    this._watchSeq = 0;
     this._shellPool = null; // 懒创建: 首个命令时建池
     this._shellQueue = [];
     this._poolSeq = 0;
@@ -286,6 +288,11 @@ class MuseBridge {
   stop() {
     this.stopping = true;
     this._destroyPool();
+    for (const [wid, w] of this._watches) {
+      try { w.watcher.dispose(); } catch (_) {}
+      try { clearInterval(w.interval); } catch (_) {}
+    }
+    this._watches.clear();
     if (this.reconnectTimer) {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;
@@ -387,6 +394,8 @@ class MuseBridge {
     if (msg.type === 'bash_output') return this.onBgOutput(msg);
     if (msg.type === 'bash_kill') return this.onBgKill(msg);
     if (msg.type === 'batch') return this.onBatch(msg);
+    if (msg.type === 'watch_log') return this.onWatchLog(msg);
+    if (msg.type === 'unwatch') return this.onUnwatch(msg);
   }
 
   // 批量执行: 一次往返跑 N 条命令, 池内并行。合并为一次审批弹窗。
@@ -410,6 +419,73 @@ class MuseBridge {
     this.log(`批量执行 [${msg.id}]: ${list.length} 条并行`);
     const results = await Promise.all(list.map((c) => this.execute(c.command, c.timeout)));
     return this.sendFileResult(msg.id, { ok: true, results });
+  }
+
+  // ---- 日志监控: 订阅文件, 关键字命中时主动推送 ----
+  async onWatchLog(msg) {
+    const raw = String(msg.path || '');
+    const p = this.resolvePath(raw);
+    const keywords = Array.isArray(msg.keywords) ? msg.keywords.map(String).filter(Boolean) : [];
+    const fs = require('fs');
+    try {
+      const st = fs.statSync(p);
+      if (!st.isFile()) return this.sendFileResult(msg.id, { ok: false, error: 'not a file' });
+    } catch (_) {
+      return this.sendFileResult(msg.id, { ok: false, error: 'file not found' });
+    }
+    const watchId = `w${Date.now().toString(36)}${(this._watchSeq++).toString(36)}`;
+    // 基线: 从文件末尾开始, 只看新增内容
+    let pos = 0;
+    try { pos = fs.statSync(p).size; } catch (_) {}
+    const lowerKeywords = keywords.map((k) => k.toLowerCase());
+    const checkNew = () => {
+      let size = 0;
+      try { size = fs.statSync(p).size; } catch (_) { return; }
+      if (size < pos) pos = 0; // 文件被截断/轮转, 从头开始
+      if (size === pos) return;
+      let data = '';
+      try {
+        const fd = fs.openSync(p, 'r');
+        const buf = Buffer.alloc(Math.min(size - pos, 4 * 1024 * 1024));
+        fs.readSync(fd, buf, 0, buf.length, pos);
+        fs.closeSync(fd);
+        data = buf.toString('utf8');
+      } catch (_) { return; }
+      pos = size;
+      const lines = data.split('\n');
+      const matches = [];
+      for (const line of lines) {
+        const ll = line.toLowerCase();
+        for (const kw of lowerKeywords) {
+          if (kw && ll.includes(kw)) { matches.push(line.slice(0, 500)); break; }
+        }
+      }
+      if (matches.length > 0 && this.ws && this.ws.readyState === 1) {
+        try {
+          this.ws.send(JSON.stringify({ type: 'log_alert', watch_id: watchId, path: p, matches: matches.slice(0, 20) }));
+        } catch (_) {}
+      }
+    };
+    // VS Code 文件监听 + 定时兜底 (网络文件系统可能不触发)
+    const watcher = vscode.workspace.createFileSystemWatcher(p);
+    const onChange = () => checkNew();
+    watcher.onDidChange(onChange);
+    watcher.onDidCreate(onChange);
+    const interval = setInterval(checkNew, 2000);
+    this._watches.set(watchId, { watcher, interval, path: p });
+    this.log(`日志监控启动 [${watchId}]: ${p}, 关键字: ${keywords.join(',') || '(无)'}`);
+    return this.sendFileResult(msg.id, { ok: true, watch_id: watchId, path: p });
+  }
+
+  async onUnwatch(msg) {
+    const watchId = String(msg.watch_id || '');
+    const w = this._watches.get(watchId);
+    if (!w) return this.sendFileResult(msg.id, { ok: false, error: 'unknown watch_id' });
+    try { w.watcher.dispose(); } catch (_) {}
+    try { clearInterval(w.interval); } catch (_) {}
+    this._watches.delete(watchId);
+    this.log(`日志监控停止 [${watchId}]`);
+    return this.sendFileResult(msg.id, { ok: true });
   }
 
   async onCmd(msg) {
