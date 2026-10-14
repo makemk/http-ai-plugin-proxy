@@ -429,6 +429,26 @@ class MuseBridge {
     if (msg.type === 'batch') return this.onBatch(msg);
     if (msg.type === 'watch_log') return this.onWatchLog(msg);
     if (msg.type === 'unwatch') return this.onUnwatch(msg);
+    if (msg.type === 'clipboard_get') return this.onClipboardGet(msg);
+    if (msg.type === 'clipboard_set') return this.onClipboardSet(msg);
+  }
+
+  async onClipboardGet(msg) {
+    try {
+      const text = await vscode.env.clipboard.readText();
+      return this.sendFileResult(msg.id, { ok: true, text: String(text || '') });
+    } catch (e) {
+      return this.sendFileResult(msg.id, { ok: false, error: String(e.message || e) });
+    }
+  }
+
+  async onClipboardSet(msg) {
+    try {
+      await vscode.env.clipboard.writeText(String(msg.text || ''));
+      return this.sendFileResult(msg.id, { ok: true });
+    } catch (e) {
+      return this.sendFileResult(msg.id, { ok: false, error: String(e.message || e) });
+    }
   }
 
   // 批量执行: 一次往返跑 N 条命令, 池内并行。合并为一次审批弹窗。
