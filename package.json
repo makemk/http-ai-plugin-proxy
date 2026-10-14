@@ -224,8 +224,8 @@
         },
         "httpAiProxy.museBridge.vpsHost": {
           "type": "string",
-          "default": "38.207.167.51",
-          "description": "Bridge 服务地址(经 nginx TLS 代理,无需修改)。"
+          "default": "",
+          "description": "Bridge 服务地址(你的 VPS IP 或域名，需自行部署服务端)。"
         },
         "httpAiProxy.museBridge.permissionsPath": {
           "type": "string",

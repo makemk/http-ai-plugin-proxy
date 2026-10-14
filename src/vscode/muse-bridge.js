@@ -29,7 +29,7 @@ function checkServerIdentityIP(host, cert) {
 }
 
 const SECRET_KEY = 'muse_bridge.token';
-const DEFAULT_HOST = '38.207.167.51'; // 443: 与 browser-gateway 同端口,经 nginx ALPN 分流
+const DEFAULT_HOST = ''; // 用户在设置里填自己的 VPS 地址
 
 // Git Bash 候选 (按用户本机 AGENTS.md §1):
 // - 绝不要用 PATH 上的裸 bash/sh: 本机 bash -> WSL (C:\windows\system32\bash.exe), sh -> Git Bash
@@ -259,6 +259,11 @@ class MuseBridge {
     const cfg = this.getConfig();
     if (!cfg.enabled) {
       this.setStatus('off');
+      return;
+    }
+    if (!cfg.vpsHost) {
+      this.setStatus('error', '未设置 VPS 地址');
+      this.log('Bridge 已启用但未设置 VPS 地址,请在设置里填写 httpAiProxy.museBridge.vpsHost。');
       return;
     }
     const token = await this.getToken();
