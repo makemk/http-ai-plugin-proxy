@@ -150,6 +150,16 @@ class MuseBridge {
     this.statusItem.command = 'museBridge.status';
     context.subscriptions.push(this.statusItem);
     this.setStatus('off');
+    // 池参数变更时重建池子 (下次命令懒创建, 用新参数)
+    this._configWatcher = vscode.workspace.onDidChangeConfiguration((e) => {
+      if (e.affectsConfiguration('httpAiProxy.museBridge.poolSize') ||
+          e.affectsConfiguration('httpAiProxy.museBridge.poolMax') ||
+          e.affectsConfiguration('httpAiProxy.museBridge.burstIdleSeconds')) {
+        this.log('池参数变更, 重建 shell 池');
+        this._destroyPool();
+      }
+    });
+    context.subscriptions.push(this._configWatcher);
   }
 
   log(msg) {
@@ -177,7 +187,18 @@ class MuseBridge {
       vpsHost: cfg.get('museBridge.vpsHost', DEFAULT_HOST),
       permissionsPath: cfg.get('museBridge.permissionsPath', ''),
       readOnly: cfg.get('museBridge.readOnly', false),
+      poolSize: cfg.get('museBridge.poolSize', POOL_SIZE),
+      poolMax: cfg.get('museBridge.poolMax', POOL_MAX),
+      burstIdleSeconds: cfg.get('museBridge.burstIdleSeconds', BURST_IDLE_MS / 1000),
     };
+  }
+
+  poolTuning() {
+    const c = this.getConfig();
+    const size = Math.max(1, Math.min(16, Math.floor(c.poolSize) || POOL_SIZE));
+    const max = Math.max(size, Math.min(32, Math.floor(c.poolMax) || POOL_MAX));
+    const idleMs = Math.max(10000, Math.min(600000, Math.floor(c.burstIdleSeconds * 1000) || BURST_IDLE_MS));
+    return { size, max, idleMs };
   }
 
   // ---- 权限配置文件: ~/.muse-bridge/permissions.json ----
@@ -835,9 +856,13 @@ class MuseBridge {
   //  - 池 shell 启动时 cwd = 首个工作区根 (pwd/ls 默认就是工作区)
   ensurePool() {
     if (this._shellPool) return;
+    const t = this.poolTuning();
+    this._poolSize = t.size;
+    this._poolMax = t.max;
+    this._burstIdleMs = t.idleMs;
     this._shellPool = [];
     this._shellQueue = [];
-    for (let i = 0; i < POOL_SIZE; i++) {
+    for (let i = 0; i < this._poolSize; i++) {
       const shell = this._spawnShell();
       if (shell) this._shellPool.push(shell);
     }
@@ -908,7 +933,7 @@ class MuseBridge {
       }
     }
     // 弹性扩容: 还有排队且没到上限, 加一个 burst shell (就绪后自动接任务)
-    if (this._shellQueue.length > 0 && this._shellPool.length < POOL_MAX) {
+    if (this._shellQueue.length > 0 && this._shellPool.length < (this._poolMax || POOL_MAX)) {
       const burst = this._spawnShell(true);
       if (burst) this._shellPool.push(burst);
     }
@@ -949,7 +974,7 @@ class MuseBridge {
     job.resolve({ exit, stdout: stdout.slice(-MAX_OUTPUT), stderr: '' });
     // burst shell 空闲后开始倒计时回收 (基线 shell 常驻不回收)
     if (shell.burst && !shell.idleTimer) {
-      shell.idleTimer = setTimeout(() => this._reapBurstShell(shell), BURST_IDLE_MS);
+      shell.idleTimer = setTimeout(() => this._reapBurstShell(shell), this._burstIdleMs || BURST_IDLE_MS);
     }
     this._dispatch();
   }

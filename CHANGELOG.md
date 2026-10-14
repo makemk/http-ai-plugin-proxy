@@ -21,6 +21,7 @@ All notable changes to the "http-ai-plugin-proxy" extension will be documented i
 - **非公网 IP 安全**：RFC1918（`10/8`、`172.16/12`、`192.168/16`）→ 直连绕行（路由器/NAS/开发板）；`169.254/16` link-local、`0/8` → 本地直接 403 拒绝，不再转发上游（堵住经 VPS 探云元数据的 SSRF 口子）。
 - **H2 回退日志**：从 error 降为 warn，并补上 H1 回退成功/失败的结果日志（之前只打 H2 的错，H1 成功了也像失败）。
 - **弹性 shell 池**：基线 4 常驻，有排队时自动 burst 到 8；burst shell 空闲 60 秒后回收，基线常驻不回收。
+- **池参数可配置**：`museBridge.poolSize`（基线，默认 4）、`museBridge.poolMax`（上限，默认 8）、`museBridge.burstIdleSeconds`（回收秒数，默认 60），改完下次命令生效。
 
 ### Fixed
 - Bridge 审查修复：后台命令补 `child.on('error')`（spawn 失败不再崩扩展宿主）；`close` 的 null 退出码记为 -1（任务不再永远显示 running）；`doListDir` 去嵌套三元 + `Promise.all`；`doEdit` 复用 `doMultiEdit` 去重复；魔法数字抽为命名常量。

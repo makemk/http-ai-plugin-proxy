@@ -236,6 +236,27 @@
           "type": "boolean",
           "default": false,
           "description": "只读模式(计划模式): 拒绝所有写操作(写文件/编辑/命令写操作), 只允许读。"
+        },
+        "httpAiProxy.museBridge.poolSize": {
+          "type": "number",
+          "default": 4,
+          "minimum": 1,
+          "maximum": 16,
+          "description": "Muse Bridge 常驻 shell 池基线大小(并发路数)。修改后下次执行命令时生效。"
+        },
+        "httpAiProxy.museBridge.poolMax": {
+          "type": "number",
+          "default": 8,
+          "minimum": 1,
+          "maximum": 32,
+          "description": "Muse Bridge shell 池紧急扩容上限(有排队时自动 burst)。必须 >= poolSize。修改后下次执行命令时生效。"
+        },
+        "httpAiProxy.museBridge.burstIdleSeconds": {
+          "type": "number",
+          "default": 60,
+          "minimum": 10,
+          "maximum": 600,
+          "description": "Muse Bridge burst shell 空闲多少秒后回收。修改后下次执行命令时生效。"
         }
       }
     }
