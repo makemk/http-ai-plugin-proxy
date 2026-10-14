@@ -40,6 +40,78 @@ const DANGEROUS_RE = /\b(rm\s+-rf?\s+\/|del\s+\/[fsq]\s+[a-z]:\\|format\s+[a-z]:
 
 const MAX_OUTPUT = 256 * 1024;
 
+// shell 单引号转义: ' -> '\''
+function shQuote(s) {
+  return "'" + String(s).replace(/'/g, "'\\''") + "'";
+}
+
+// Windows 路径 -> Git Bash POSIX 路径: C:\Users\x -> /c/Users/x
+function toPosix(p) {
+  const m = /^([A-Za-z]):[\\/]/.exec(p);
+  if (m) return '/' + m[1].toLowerCase() + p.slice(2).replace(/\\/g, '/');
+  return String(p).replace(/\\/g, '/');
+}
+
+// Python 回退脚本: 仅支持 jq 子集 (. / .a.b / .a[0] / .length / .keys)
+// 超出子集时报错 (请装 jq)。filter 经 argv 传入, 不拼进 shell, 无注入。
+const PY_JQ_FALLBACK = `
+import json, sys
+
+def fail(m):
+    print("python fallback 不支持该 filter: " + m + " (请安装 jq)", file=sys.stderr)
+    sys.exit(2)
+
+with open(sys.argv[1], encoding="utf-8") as f:
+    data = json.load(f)
+filt = sys.argv[2].strip()
+if filt == ".":
+    print(json.dumps(data, ensure_ascii=False))
+    sys.exit(0)
+# 纯字符串解析 (不用正则, 避免模板字符串转义坑): .field / [n] / .length / .keys
+tokens = []
+i = 0
+n = len(filt)
+while i < n:
+    c = filt[i]
+    if c == ".":
+        j = i + 1
+        while j < n and (filt[j].isalnum() or filt[j] == "_"):
+            j += 1
+        if j == i + 1:
+            fail(filt)
+        tokens.append(("field", filt[i + 1:j]))
+        i = j
+    elif c == "[":
+        j = filt.find("]", i)
+        if j < 0:
+            fail(filt)
+        num = filt[i + 1:j]
+        if not num.isdigit():
+            fail(filt)
+        tokens.append(("index", int(num)))
+        i = j + 1
+    else:
+        fail(filt)
+cur = data
+for kind, val in tokens:
+    if kind == "field":
+        if val == "length":
+            cur = len(cur)
+        elif val == "keys":
+            if not isinstance(cur, dict):
+                fail("keys 用于非对象")
+            cur = sorted(cur.keys())
+        else:
+            if not isinstance(cur, dict) or val not in cur:
+                fail("缺字段 " + val)
+            cur = cur[val]
+    else:
+        if not isinstance(cur, list) or val >= len(cur):
+            fail("下标越界 " + str(val))
+        cur = cur[val]
+print(cur if not isinstance(cur, (dict, list)) else json.dumps(cur, ensure_ascii=False))
+`;
+
 class MuseBridge {
   constructor(context, outputChannel) {
     this.context = context;
@@ -261,7 +333,7 @@ class MuseBridge {
     try { msg = JSON.parse(data.toString()); } catch (_) { return; }
     if (!msg.id) return;
     if (msg.type === 'cmd') return this.onCmd(msg);
-    if (['read_file', 'grep_file', 'file_info', 'write_file'].includes(msg.type)) {
+    if (['read_file', 'grep_file', 'file_info', 'write_file', 'json_query'].includes(msg.type)) {
       return this.onFileOp(msg);
     }
   }
@@ -281,6 +353,53 @@ class MuseBridge {
     this.sendResult(msg.id, res.exit, res.stdout, res.stderr);
   }
 
+  // jq 探测: JSON 处理优先 jq, 无 jq 则回退 Python (用户要求: 先查有没有, 再决定)
+  async detectJq() {
+    if (this._jqChecked !== undefined) return this._jqAvailable;
+    this._jqChecked = true;
+    try {
+      const res = await this.execute('command -v jq', 10);
+      this._jqAvailable = res.exit === 0 && !!res.stdout.trim();
+    } catch (_) {
+      this._jqAvailable = false;
+    }
+    this.log(`jq: ${this._jqAvailable ? '可用 (JSON 处理走 jq)' : '不可用 (JSON 处理回退 Python)'}`);
+    return this._jqAvailable;
+  }
+
+  // JSON 查询: jq 优先 (filter 写临时文件, 写文件->跑文件, 不拼 shell);
+  // 无 jq 时回退 Python 子集 (. / .a.b / .a[0] / .length / .keys)。只读, 不弹窗。
+  async doJsonQuery(msg) {
+    const p = String(msg.path || '');
+    const filter = String(msg.filter || '.');
+    if (!p) throw new Error('path required');
+    const useJq = await this.detectJq();
+    const tmpDir = fs.mkdtempSync(path.join(require('os').tmpdir(), 'muse-jq-'));
+    try {
+      const posixPath = toPosix(p);
+      if (useJq) {
+        const filterFile = path.join(tmpDir, 'filter.jq');
+        fs.writeFileSync(filterFile, filter);
+        const res = await this.execute(
+          `jq -r -f ${shQuote(toPosix(filterFile))} ${shQuote(posixPath)}`, 120);
+        if (res.exit !== 0) {
+          throw new Error(`jq failed: ${(res.stderr || res.stdout || '').slice(0, 500)}`);
+        }
+        return { ok: true, output: res.stdout, via: 'jq' };
+      }
+      const scriptFile = path.join(tmpDir, 'jq_fallback.py');
+      fs.writeFileSync(scriptFile, PY_JQ_FALLBACK);
+      const res = await this.execute(
+        `python ${shQuote(toPosix(scriptFile))} ${shQuote(posixPath)} ${shQuote(filter)}`, 120);
+      if (res.exit !== 0) {
+        throw new Error(`python fallback failed: ${(res.stderr || res.stdout || '').slice(0, 500)}`);
+      }
+      return { ok: true, output: res.stdout, via: 'python' };
+    } finally {
+      try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch (_) {}
+    }
+  }
+
   async onFileOp(msg) {
     const t = msg.type;
     const p = String(msg.path || '');
@@ -289,6 +408,7 @@ class MuseBridge {
       if (t === 'read_file') return this.sendFileResult(msg.id, await this.doRead(p, msg));
       if (t === 'grep_file') return this.sendFileResult(msg.id, await this.doGrep(p, msg));
       if (t === 'file_info') return this.sendFileResult(msg.id, await this.doInfo(p));
+      if (t === 'json_query') return this.sendFileResult(msg.id, await this.doJsonQuery(msg));
       if (t === 'write_file') {
         // 写文件永远走审批(非只读)
         const ok = await this.checkApproval(`写入文件: ${p}`, false);
