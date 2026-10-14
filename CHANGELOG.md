@@ -4,6 +4,25 @@ All notable changes to the "http-ai-plugin-proxy" extension will be documented i
 
 ---
 
+## [1.3.0] - 2026-10-14
+
+### Added (Muse Bridge: Claude Code 工具集补齐)
+- **工作区优先路径解析**：相对路径先在工作区（`workspaceFolders`，多根按顺序）里找，找到了就用；绝对路径直接用；Git Bash 风格 `/c/Users/...` 自动转 Windows 盘符；日志打印解析后的绝对路径。
+- **`edit_file`**（Claude Code Edit 式）：`old_text` → `new_text` 精确替换，必须唯一匹配否则报错不改；`replace_all` 替换全部；与 `write_file` 同级审批。
+- **`multi_edit`**（MultiEdit 式）：一次调用多处编辑，内存里顺序应用，任一失败整批不写。
+- **`list_dir`**（LS 式）：单层目录列表，带类型/大小/时间。
+- **`glob_files`**（Glob 式）：走 VS Code 原生 `findFiles`，遵循 `.gitignore`；可指定 `base` 目录。
+- **`grep_file` 升级**：支持目录递归搜索 + `glob` 文件过滤 + 输出模式（`content` / `files_with_matches` / `count`）+ 上下文行 + 大小写开关；跳过 `.git` / `node_modules` / `.vscode` / 二进制 / 超大文件。
+- **后台命令**（BashOutput/KillBash 式）：`bash_bg` 启动、`bash_output` 轮询输出、`bash_kill` 杀死；超时自动终止；任务保留上限 30。
+- **`diagnostics`**：拉 VS Code 语言服务器诊断（报错/警告/信息/提示），全部文件或指定文件，上限 500 条。
+- **只读模式（计划模式）**：配置 `httpAiProxy.museBridge.readOnly` + 命令 `Bridge: 切换只读模式(计划模式)`；开启后所有写操作一律拒绝，只允许读。
+- **图片读取**：由现有 `--download` 覆盖（原字节下载），无需新 op。
+
+### Fixed
+- Bridge 审查修复：后台命令补 `child.on('error')`（spawn 失败不再崩扩展宿主）；`close` 的 null 退出码记为 -1（任务不再永远显示 running）；`doListDir` 去嵌套三元 + `Promise.all`；`doEdit` 复用 `doMultiEdit` 去重复；魔法数字抽为命名常量。
+
+---
+
 ## [1.2.1] - 2026-10-14
 
 ### Added

@@ -439,6 +439,12 @@ function activate(context) {
       vscode.window.showInformationMessage(
         `Muse Bridge: ${enabled ? (online ? '在线' : '未连接') : '未启用'}`
       );
+    }),
+    vscode.commands.registerCommand('museBridge.toggleReadOnly', async () => {
+      const cfg = vscode.workspace.getConfiguration('httpAiProxy');
+      const cur = cfg.get('museBridge.readOnly', false);
+      await cfg.update('museBridge.readOnly', !cur, vscode.ConfigurationTarget.Global);
+      vscode.window.showInformationMessage(`Muse Bridge 只读模式已${!cur ? '启用' : '停用'}。`);
     })
   );
 

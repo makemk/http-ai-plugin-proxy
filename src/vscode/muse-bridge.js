@@ -54,6 +54,10 @@ const READONLY_RE = /^\s*(echo|ls|dir|cat|type|pwd|cd|whoami|hostname|uname|df|d
 const DANGEROUS_RE = /\b(rm\s+-rf?\s+\/|del\s+\/[fsq]\s+[a-z]:\\|format\s+[a-z]:|mkfs|shutdown(\.exe)?\s+\/|reboot|reg\s+delete|rd\s+\/s\s+[a-z]:\\)/i;
 
 const MAX_OUTPUT = 256 * 1024;
+const MAX_BG_BUFFER = 1024 * 1024; // 后台命令单流输出上限
+const MAX_BG_JOBS = 30; // 后台任务保留上限
+const MAX_GREP_FILE = 4 * 1024 * 1024; // grep 单文件上限, 超过跳过
+const MAX_DIAGNOSTICS = 500; // 诊断返回上限
 
 // shell 单引号转义: ' -> '\''
 function shQuote(s) {
@@ -135,6 +139,8 @@ class MuseBridge {
     this.reconnectTimer = null;
     this.reconnectDelay = 2000;
     this.stopping = false;
+    this._bgJobs = new Map();
+    this._bgSeq = 0;
     this.statusItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100);
     this.statusItem.command = 'museBridge.status';
     context.subscriptions.push(this.statusItem);
@@ -165,6 +171,7 @@ class MuseBridge {
       gitBashPath: cfg.get('museBridge.gitBashPath', ''),
       vpsHost: cfg.get('museBridge.vpsHost', DEFAULT_HOST),
       permissionsPath: cfg.get('museBridge.permissionsPath', ''),
+      readOnly: cfg.get('museBridge.readOnly', false),
     };
   }
 
@@ -357,9 +364,13 @@ class MuseBridge {
     try { msg = JSON.parse(data.toString()); } catch (_) { return; }
     if (!msg.id) return;
     if (msg.type === 'cmd') return this.onCmd(msg);
-    if (['read_file', 'grep_file', 'file_info', 'write_file', 'json_query'].includes(msg.type)) {
+    if (['read_file', 'grep_file', 'file_info', 'write_file', 'json_query',
+      'edit_file', 'multi_edit', 'list_dir', 'glob_files', 'diagnostics'].includes(msg.type)) {
       return this.onFileOp(msg);
     }
+    if (msg.type === 'bash_bg') return this.onBgStart(msg);
+    if (msg.type === 'bash_output') return this.onBgOutput(msg);
+    if (msg.type === 'bash_kill') return this.onBgKill(msg);
   }
 
   async onCmd(msg) {
@@ -375,6 +386,61 @@ class MuseBridge {
     const res = await this.execute(command, timeout);
     this.log(`命令 [${msg.id}] 执行完毕,exit=${res.exit}`);
     this.sendResult(msg.id, res.exit, res.stdout, res.stderr);
+  }
+
+  // ---- 后台命令 (Claude Code BashOutput/KillBash 式): 启动后轮询输出, 可杀 ----
+  async onBgStart(msg) {
+    const command = String(msg.command || '');
+    const timeout = Math.min(Math.max(parseInt(msg.timeout, 10) || 120, 5), 3600);
+    if (!command) return this.sendFileResult(msg.id, { ok: false, error: 'empty command' });
+    const approved = await this.checkApproval(command, READONLY_RE.test(command));
+    if (!approved) {
+      this.log(`后台命令 [${msg.id}] 被用户拒绝。`);
+      return this.sendFileResult(msg.id, { ok: false, error: 'rejected by user' });
+    }
+    const bash = this.resolveBash();
+    if (!bash) return this.sendFileResult(msg.id, { ok: false, error: 'Git Bash not found' });
+    const jobId = `bg${Date.now().toString(36)}${(this._bgSeq++).toString(36)}`;
+    const { spawn } = require('child_process');
+    const child = spawn(bash, ['-l', '-c', command], { windowsHide: true });
+    const job = { child, stdout: '', stderr: '', exit: null };
+    this._bgJobs.set(jobId, job);
+    if (this._bgJobs.size > MAX_BG_JOBS) { // 清理: 删一个最早已完成的
+      for (const [k, v] of this._bgJobs) {
+        if (v.exit !== null) { this._bgJobs.delete(k); break; }
+      }
+    }
+    child.stdout.on('data', (d) => { job.stdout = (job.stdout + d.toString()).slice(-MAX_BG_BUFFER); });
+    child.stderr.on('data', (d) => { job.stderr = (job.stderr + d.toString()).slice(-MAX_BG_BUFFER); });
+    // 必须监听 error: 否则 spawn 失败时未捕获的 error 事件会崩扩展宿主
+    child.on('error', (err) => { job.exit = -1; job.stderr += `\n[SPAWN ERROR] ${err.message}`; });
+    // close 的 code 为 null 表示被信号杀死, 记为 -1, 否则任务永远显示 running
+    child.on('close', (code) => { job.exit = code !== null ? code : -1; });
+    setTimeout(() => {
+      if (job.exit === null) {
+        try { child.kill(); } catch (_) {}
+        job.stderr += '\n[TIMEOUT] 后台命令超时已被终止';
+      }
+    }, timeout * 1000);
+    this.log(`后台命令启动 [${jobId}]: ${command.slice(0, 120)}`);
+    this.sendFileResult(msg.id, { ok: true, job_id: jobId });
+  }
+
+  async onBgOutput(msg) {
+    const job = this._bgJobs.get(String(msg.job_id || ''));
+    if (!job) return this.sendFileResult(msg.id, { ok: false, error: 'unknown job_id' });
+    this.sendFileResult(msg.id, {
+      ok: true, job_id: String(msg.job_id), running: job.exit === null,
+      stdout: job.stdout.slice(-MAX_OUTPUT), stderr: job.stderr.slice(-MAX_OUTPUT), exit: job.exit,
+    });
+  }
+
+  async onBgKill(msg) {
+    const job = this._bgJobs.get(String(msg.job_id || ''));
+    if (!job) return this.sendFileResult(msg.id, { ok: false, error: 'unknown job_id' });
+    if (job.exit !== null) return this.sendFileResult(msg.id, { ok: true, killed: false, exit: job.exit });
+    try { job.child.kill(); } catch (_) {}
+    this.sendFileResult(msg.id, { ok: true, killed: true, exit: job.exit });
   }
 
   // jq 探测: JSON 处理优先 jq, 无 jq 则回退 Python (用户要求: 先查有没有, 再决定)
@@ -424,10 +490,29 @@ class MuseBridge {
     }
   }
 
+  // 路径解析 (Claude Code 式): 相对路径优先工作区, 绝对路径直接用。
+  // Git Bash 风格 /c/Users/... 转 Windows 盘符; 相对路径按工作区顺序找, 找到存在的就用,
+  // 都不存在则落到首个工作区 (写新文件时就是这种情况)。
+  resolvePath(p) {
+    let s = String(p || '');
+    const m = /^\/([a-zA-Z])\/.*/.exec(s);
+    if (m) s = `${m[1].toUpperCase()}:\\${s.slice(3).replace(/\//g, '\\')}`;
+    if (path.win32.isAbsolute(s)) return s;
+    const folders = (vscode.workspace.workspaceFolders || []).map((f) => f.uri.fsPath);
+    for (const dir of folders) {
+      const cand = path.join(dir, s);
+      if (fs.existsSync(cand)) return cand;
+    }
+    if (folders.length) return path.join(folders[0], s);
+    return s;
+  }
+
   async onFileOp(msg) {
     const t = msg.type;
-    const p = String(msg.path || '');
-    this.log(`文件操作 [${msg.id}]: ${t} ${p.slice(0, 100)}`);
+    const raw = String(msg.path || '');
+    const p = this.resolvePath(raw);
+    msg.path = p; // 统一解析, 各 handler 直接用 msg.path
+    this.log(`文件操作 [${msg.id}]: ${t} ${p.slice(0, 100)}${p !== raw ? ` (解析自 ${raw.slice(0, 60)})` : ''}`);
     try {
       if (t === 'read_file') return this.sendFileResult(msg.id, await this.doRead(p, msg));
       if (t === 'grep_file') return this.sendFileResult(msg.id, await this.doGrep(p, msg));
@@ -442,6 +527,26 @@ class MuseBridge {
         }
         return this.sendFileResult(msg.id, await this.doWrite(p, msg));
       }
+      if (t === 'edit_file') {
+        // 精确替换, 与 write_file 同级审批
+        const ok = await this.checkApproval(`编辑文件: ${p}`, false);
+        if (!ok) {
+          this.log(`编辑文件 [${msg.id}] 被用户拒绝。`);
+          return this.sendFileResult(msg.id, { ok: false, error: 'rejected by user' });
+        }
+        return this.sendFileResult(msg.id, await this.doEdit(p, msg));
+      }
+      if (t === 'multi_edit') {
+        const ok = await this.checkApproval(`批量编辑文件: ${p}`, false);
+        if (!ok) {
+          this.log(`批量编辑 [${msg.id}] 被用户拒绝。`);
+          return this.sendFileResult(msg.id, { ok: false, error: 'rejected by user' });
+        }
+        return this.sendFileResult(msg.id, await this.doMultiEdit(p, msg));
+      }
+      if (t === 'list_dir') return this.sendFileResult(msg.id, await this.doListDir(p, msg));
+      if (t === 'glob_files') return this.sendFileResult(msg.id, await this.doGlob(msg));
+      if (t === 'diagnostics') return this.sendFileResult(msg.id, await this.doDiagnostics(msg));
     } catch (e) {
       this.log(`文件操作 [${msg.id}] 异常: ${e.message}`);
       this.sendFileResult(msg.id, { ok: false, error: e.message });
@@ -466,24 +571,100 @@ class MuseBridge {
     };
   }
 
+  // glob 转正则: **/ -> 任意层目录, ** -> 任意字符, * -> 非斜杠, ? -> 单个非斜杠
+  _globToRegExp(glob) {
+    let re = '^';
+    for (let i = 0; i < glob.length; i++) {
+      const c = glob[i];
+      if (c === '*') {
+        if (glob[i + 1] === '*') {
+          if (glob[i + 2] === '/') { re += '(?:.*/)?'; i += 2; }
+          else { re += '.*'; i++; }
+        } else re += '[^/]*';
+      } else if (c === '?') re += '[^/]';
+      else if ('.+^${}()|[]\\'.includes(c)) re += '\\' + c;
+      else re += c;
+    }
+    return new RegExp(re + '$');
+  }
+
+  // 递归列文件 (搜目录时用): 跳过 .git/node_modules/.vscode, 可按 glob 过滤
+  async _walkFiles(dir, globFilter, root) {
+    const out = [];
+    const re = globFilter ? this._globToRegExp(globFilter) : null;
+    const skip = new Set(['.git', 'node_modules', '.vscode']);
+    const walk = async (d) => {
+      let entries;
+      try { entries = await fs.promises.readdir(d, { withFileTypes: true }); } catch (_) { return; }
+      for (const e of entries) {
+        const full = path.join(d, e.name);
+        if (e.isDirectory()) {
+          if (skip.has(e.name)) continue;
+          await walk(full);
+        } else if (e.isFile()) {
+          if (re) {
+            const rel = path.relative(root, full).replace(/\\/g, '/');
+            const target = globFilter.includes('/') ? rel : e.name;
+            if (!re.test(target)) continue;
+          }
+          out.push(full);
+        }
+      }
+    };
+    await walk(dir);
+    return out;
+  }
+
+  // 内容搜索 (Claude Code Grep 式): 单文件或目录, 支持 glob 过滤 / 输出模式 / 上下文 / 大小写。
   async doGrep(p, msg) {
     const pattern = String(msg.pattern || '');
-    const maxMatches = Math.min(Math.max(parseInt(msg.max_matches, 10) || 200, 1), 5000);
     if (!pattern) throw new Error('empty pattern');
-    const re = new RegExp(pattern);
+    const maxMatches = Math.min(Math.max(parseInt(msg.max_matches, 10) || 200, 1), 5000);
+    const outputMode = ['content', 'files_with_matches', 'count'].includes(msg.output_mode)
+      ? msg.output_mode : 'content';
+    const context = Math.min(Math.max(parseInt(msg.context, 10) || 0, 0), 10);
+    const caseSensitive = msg.case_sensitive !== false && msg.case_sensitive !== 'false';
+    const globFilter = String(msg.glob || '');
+    const re = new RegExp(pattern, caseSensitive ? '' : 'i');
+    const st = await fs.promises.stat(p);
+    // 单文件: glob 过滤不适用 (用户已明确指定文件), 仅目录搜索时过滤
+    const files = st.isDirectory() ? await this._walkFiles(p, globFilter, p) : [p];
     const matches = [];
-    let total = 0, lineno = 0;
-    const rl = require('readline').createInterface({
-      input: fs.createReadStream(p, { encoding: 'utf8' }),
-      crlfDelay: Infinity,
-    });
-    for await (const line of rl) {
-      lineno++;
-      if (re.test(line)) {
+    const filesHit = [];
+    const counts = [];
+    let total = 0;
+    for (const f of files) {
+      let buf;
+      try {
+        const fst = await fs.promises.stat(f);
+        if (fst.size > MAX_GREP_FILE) continue; // 超大文件跳过
+        buf = await fs.promises.readFile(f);
+      } catch (_) { continue; }
+      if (buf.indexOf(0) !== -1) continue; // 二进制跳过
+      const lines = buf.toString('utf8').split(/\r?\n/);
+      let fileCount = 0;
+      for (let i = 0; i < lines.length; i++) {
+        if (!re.test(lines[i])) continue;
         total++;
-        if (matches.length < maxMatches) matches.push({ line: lineno, text: line.slice(0, 500) });
+        fileCount++;
+        if (outputMode === 'content' && matches.length < maxMatches) {
+          const m = { file: f, line: i + 1, text: lines[i].slice(0, 500) };
+          if (context > 0) {
+            m.before = [];
+            m.after = [];
+            for (let j = Math.max(0, i - context); j < i; j++) m.before.push({ line: j + 1, text: lines[j].slice(0, 500) });
+            for (let j = i + 1; j <= Math.min(lines.length - 1, i + context); j++) m.after.push({ line: j + 1, text: lines[j].slice(0, 500) });
+          }
+          matches.push(m);
+        }
+      }
+      if (fileCount > 0) {
+        filesHit.push(f);
+        if (outputMode === 'count') counts.push({ file: f, count: fileCount });
       }
     }
+    if (outputMode === 'files_with_matches') return { files: filesHit, total };
+    if (outputMode === 'count') return { counts, total };
     return { matches, total };
   }
 
@@ -499,6 +680,105 @@ class MuseBridge {
     return { bytes: raw.length };
   }
 
+  // 精确替换 (Claude Code Edit 式): 单条编辑即 MultiEdit, 逻辑复用 doMultiEdit。
+  async doEdit(p, msg) {
+    return this.doMultiEdit(p, {
+      edits: [{ old_text: msg.old_text, new_text: msg.new_text, replace_all: msg.replace_all }],
+    });
+  }
+
+  // 批量编辑 (Claude Code MultiEdit 式): 全部编辑在内存里顺序应用, 任一失败则整批不写。
+  async doMultiEdit(p, msg) {
+    const edits = msg.edits;
+    if (!Array.isArray(edits) || edits.length === 0) throw new Error('edits required');
+    let content = await fs.promises.readFile(p, 'utf8');
+    let total = 0;
+    for (const e of edits) {
+      const oldText = String(e?.old_text ?? '');
+      const newText = String(e?.new_text ?? '');
+      const replaceAll = e?.replace_all === true || e?.replace_all === 'true';
+      if (!oldText) throw new Error('empty old_text in an edit');
+      const count = content.split(oldText).length - 1;
+      if (count === 0) throw new Error(`old_text not found: ${oldText.slice(0, 80)}`);
+      if (count > 1 && !replaceAll) {
+        throw new Error(`old_text matches ${count} times: ${oldText.slice(0, 80)}`);
+      }
+      content = replaceAll ? content.split(oldText).join(newText) : content.replace(oldText, newText);
+      total += replaceAll ? count : 1;
+    }
+    await fs.promises.writeFile(p, content, 'utf8');
+    return { replacements: total, bytes: Buffer.byteLength(content) };
+  }
+
+  // 目录列表 (Claude Code LS 式): 单层, 带类型/大小/时间。
+  async doListDir(p, msg) {
+    const st = await fs.promises.stat(p);
+    if (!st.isDirectory()) throw new Error('not a directory');
+    const entries = await fs.promises.readdir(p, { withFileTypes: true });
+    const out = await Promise.all(entries.map(async (e) => {
+      let size = 0, mtime = 0;
+      try {
+        const s = await fs.promises.stat(path.join(p, e.name));
+        size = s.size; mtime = s.mtimeMs;
+      } catch (_) { /* 断链等: 保留条目, 大小为 0 */ }
+      let type = 'other';
+      if (e.isDirectory()) type = 'dir';
+      else if (e.isFile()) type = 'file';
+      else if (e.isSymbolicLink()) type = 'link';
+      return { name: e.name, type, size, mtime };
+    }));
+    return { entries: out };
+  }
+
+  // 文件模式搜索 (Claude Code Glob 式): 走 VS Code 原生 findFiles, 遵循 .gitignore。
+  async doGlob(msg) {
+    const pattern = String(msg.pattern || '');
+    if (!pattern) throw new Error('empty pattern');
+    const maxResults = Math.min(Math.max(parseInt(msg.max_results, 10) || 1000, 1), 10000);
+    let uris;
+    const base = String(msg.base || '');
+    if (base) {
+      const basePath = this.resolvePath(base);
+      uris = await vscode.workspace.findFiles(
+        new vscode.RelativePattern(vscode.Uri.file(basePath), pattern), null, maxResults);
+    } else {
+      uris = await vscode.workspace.findFiles(pattern, null, maxResults);
+    }
+    return { files: uris.map((u) => u.fsPath) };
+  }
+
+  // VS Code 诊断 (语言服务器报错/警告): 全部文件或指定文件。
+  async doDiagnostics(msg) {
+    const file = String(msg.file || '');
+    let all;
+    if (file) {
+      const uri = vscode.Uri.file(this.resolvePath(file));
+      all = [[uri, vscode.languages.getDiagnostics(uri)]];
+    } else {
+      all = vscode.languages.getDiagnostics();
+    }
+    const sevNames = ['error', 'warning', 'information', 'hint'];
+    const out = [];
+    for (const [uri, diags] of all) {
+      for (const d of diags) {
+        if (out.length >= MAX_DIAGNOSTICS) break;
+        out.push({
+          file: uri.fsPath,
+          severity: sevNames[d.severity] || String(d.severity),
+          message: d.message,
+          source: d.source || '',
+          code: (d.code && typeof d.code === 'object') ? d.code.value : (d.code || ''),
+          range: {
+            start: { line: d.range.start.line, character: d.range.start.character },
+            end: { line: d.range.end.line, character: d.range.end.character },
+          },
+        });
+      }
+      if (out.length >= MAX_DIAGNOSTICS) break;
+    }
+    return { diagnostics: out, total: out.length };
+  }
+
   sendFileResult(id, obj) {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
       this.log(`文件结果 [${id}] 发送失败:连接已断开`);
@@ -512,6 +792,11 @@ class MuseBridge {
   }
 
   async checkApproval(display, isReadonly) {
+    // 计划模式 (只读): 非只读操作一律拒绝
+    if (this.getConfig().readOnly && !isReadonly) {
+      this.log(`只读模式: 拒绝 ${display.slice(0, 80)}`);
+      return false;
+    }
     if (this.checkPermissionFile(display)) return true; // 权限文件:默认全放行
     const mode = this.getConfig().approvalMode;
     const isDangerous = DANGEROUS_RE.test(display);
