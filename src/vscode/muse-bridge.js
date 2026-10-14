@@ -290,9 +290,14 @@ class MuseBridge {
     this.log(`正在连接 ${url} ...`);
     let ws;
     try {
+      // ws 库会对 IP 主机把 servername 置空, 导致 Node 按 DNS 名校验 IP 证书而失败
+      // ("Cert does not contain a DNS name")。显式传入 servername, 让校验拿到真实 host。
+      let servername;
+      try { servername = new URL(url).hostname; } catch (_) { servername = undefined; }
       ws = new WebSocket(url, {
         headers: { 'X-Bridge-Token': token },
         handshakeTimeout: 15000,
+        ...(servername ? { servername } : {}),
         checkServerIdentity: checkServerIdentityIP,
       });
     } catch (e) {
