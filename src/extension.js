@@ -227,6 +227,9 @@ async function showControlMenu() {
   const isRunning = (!!proxyServer && isOwner) || (!isOwner && (await checkProxyHealth(getExtensionConfig().localPort)).alive);
   const port = proxyServer?.port || cachedUpstreamConfig?.port || getExtensionConfig().localPort || 18889;
   const modeLabel = isOwner ? '主服务窗口' : (isRunning ? '多窗口共享' : '已停止');
+  const bridgeEnabled = vscode.workspace.getConfiguration('httpAiProxy').get('museBridge.enabled', false);
+  const bridgeOnline = museBridge?.ws?.readyState === 1;
+  const bridgeStatus = bridgeOnline ? '在线' : (bridgeEnabled ? '未连接' : '已停用');
 
   const items = [
     {
@@ -278,6 +281,25 @@ async function showControlMenu() {
       label: '$(cloud-download) 检查最新版本更新',
       description: '检查 GitHub Releases 或私有 VPS 源是否有新版本并一键自动升级',
       action: 'update'
+    },
+    {
+      label: 'Muse Bridge',
+      kind: vscode.QuickPickItemKind.Separator
+    },
+    {
+      label: bridgeEnabled ? '$(circle-slash) Bridge: 停用' : '$(play) Bridge: 启用',
+      description: `当前: ${bridgeStatus}`,
+      action: 'bridgeToggle'
+    },
+    {
+      label: '$(key) Bridge: 设置 Token',
+      description: '设置连接 VPS 的 Bridge Token',
+      action: 'bridgeToken'
+    },
+    {
+      label: '$(info) Bridge: 查看连接状态',
+      description: `当前: ${bridgeStatus}`,
+      action: 'bridgeStatus'
     }
   ];
 
@@ -335,6 +357,15 @@ async function showControlMenu() {
       await checkForUpdates(extensionContext, true, {
         configPath: proxyServer ? proxyServer.resolveConfigPath() : getExtensionConfig().configPath
       });
+      break;
+    case 'bridgeToggle':
+      await vscode.commands.executeCommand('museBridge.toggle');
+      break;
+    case 'bridgeToken':
+      await vscode.commands.executeCommand('museBridge.setToken');
+      break;
+    case 'bridgeStatus':
+      await vscode.commands.executeCommand('museBridge.status');
       break;
   }
 }
