@@ -415,6 +415,8 @@ class MuseBridge {
   async onMessage(data) {
     let msg;
     try { msg = JSON.parse(data.toString()); } catch (_) { return; }
+    // 通知类消息 (无需 id, 无需回执)
+    if (msg.type === 'transfer_notify') return this.onTransferNotify(msg);
     if (!msg.id) return;
     if (msg.type === 'cmd') return this.onCmd(msg);
     if (['read_file', 'grep_file', 'file_info', 'write_file', 'json_query',
@@ -517,6 +519,54 @@ class MuseBridge {
     this._watches.delete(watchId);
     this.log(`日志监控停止 [${watchId}]`);
     return this.sendFileResult(msg.id, { ok: true });
+  }
+
+  // 大文件传输进度通知: 在 VS Code 右下角显示进度条。
+  // msg: { type:'transfer_notify', tid, phase:'start'|'progress'|'done', label, message }
+  // 大文件传输进度通知: 在 VS Code 右下角显示进度条。
+  // msg: { type:'transfer_notify', tid, phase:'start'|'progress'|'done', label, message }
+  onTransferNotify(msg) {
+    const tid = String(msg.tid || '');
+    const phase = String(msg.phase || '');
+    if (!tid) return;
+    if (!this._transfers) this._transfers = new Map();
+
+    if (phase === 'start') {
+      if (this._transfers.has(tid)) return;
+      const label = String(msg.label || tid);
+      let done = null;
+      const finished = new Promise((res) => { done = res; });
+      const t = { progress: null, done, pending: [] };
+      this._transfers.set(tid, t);
+      if (msg.message) t.pending.push(String(msg.message));
+      vscode.window.withProgress({
+        location: vscode.ProgressLocation.Notification,
+        title: `传输: ${label}`,
+        cancellable: false,
+      }, (progress) => {
+        t.progress = progress;
+        for (const m of t.pending) progress.report({ message: m });
+        t.pending = [];
+        return finished;
+      }).then(() => {}, () => {});
+      this.log(`传输开始 [${tid}] ${label}`);
+      return;
+    }
+
+    const t = this._transfers.get(tid);
+    if (!t) return;
+    if (phase === 'progress') {
+      const m = String(msg.message || '');
+      if (t.progress) t.progress.report({ message: m });
+      else t.pending.push(m);
+      return;
+    }
+    if (phase === 'done') {
+      try { t.done(); } catch (_) {}
+      this._transfers.delete(tid);
+      this.log(`传输完成 [${tid}]`);
+      return;
+    }
   }
 
   async onCmd(msg) {
