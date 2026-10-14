@@ -53,7 +53,9 @@ const READONLY_RE = /^\s*(echo|ls|dir|cat|type|pwd|cd|whoami|hostname|uname|df|d
 const DANGEROUS_RE = /\b(rm\s+-rf?\s+\/|del\s+\/[fsq]\s+[a-z]:\\|format\s+[a-z]:|mkfs|shutdown(\.exe)?\s+\/|reboot|reg\s+delete|rd\s+\/s\s+[a-z]:\\)/i;
 
 const MAX_OUTPUT = 256 * 1024;
-const POOL_SIZE = 4; // 常驻 shell 池大小 (并发路数)
+const POOL_SIZE = 4; // 基线常驻 shell 数
+const POOL_MAX = 8; // 紧急扩容上限
+const BURST_IDLE_MS = 60000; // burst shell 空闲 60s 后回收
 const MAX_BG_BUFFER = 1024 * 1024; // 后台命令单流输出上限
 const MAX_BG_JOBS = 30; // 后台任务保留上限
 const MAX_GREP_FILE = 4 * 1024 * 1024; // grep 单文件上限, 超过跳过
@@ -841,7 +843,7 @@ class MuseBridge {
     }
   }
 
-  _spawnShell() {
+  _spawnShell(isBurst = false) {
     const bash = this.resolveBash();
     if (!bash) return null;
     const folders = (vscode.workspace.workspaceFolders || []).map((f) => f.uri.fsPath);
@@ -850,6 +852,7 @@ class MuseBridge {
     const child = spawn(bash, ['-l'], { cwd, windowsHide: true });
     const shell = {
       child, buffer: '', current: null, alive: true, ready: false,
+      burst: !!isBurst, idleTimer: null,
       readyMarker: `__MUSE_READY_${Date.now().toString(36)}${(this._poolSeq++).toString(36)}__`,
     };
     child.stdout.on('data', (d) => this._onShellData(shell, d.toString()));
@@ -891,6 +894,7 @@ class MuseBridge {
       const job = this._shellQueue.shift();
       shell.current = job;
       job.shell = shell;
+      if (shell.idleTimer) { clearTimeout(shell.idleTimer); shell.idleTimer = null; } // burst shell 复用, 取消回收
       shell.buffer = ''; // 丢弃残留 (防御)
       job.timer = setTimeout(() => this._onJobTimeout(job), job.timeout * 1000);
       const wrapped = `(\n${job.command}\n) < /dev/null\necho "${job.marker}:$?"\n`;
@@ -903,6 +907,17 @@ class MuseBridge {
         job.resolve({ exit: -1, stdout: '', stderr: 'shell stdin closed' });
       }
     }
+    // 弹性扩容: 还有排队且没到上限, 加一个 burst shell (就绪后自动接任务)
+    if (this._shellQueue.length > 0 && this._shellPool.length < POOL_MAX) {
+      const burst = this._spawnShell(true);
+      if (burst) this._shellPool.push(burst);
+    }
+  }
+
+  _reapBurstShell(shell) {
+    shell.idleTimer = null;
+    if (!shell.burst || !shell.alive || shell.current) return; // 已被复用或已死
+    this._killShell(shell); // _killShell 对 burst 不重开 (见下)
   }
 
   _onShellData(shell, chunk) {
@@ -932,6 +947,10 @@ class MuseBridge {
     clearTimeout(job.timer);
     shell.current = null;
     job.resolve({ exit, stdout: stdout.slice(-MAX_OUTPUT), stderr: '' });
+    // burst shell 空闲后开始倒计时回收 (基线 shell 常驻不回收)
+    if (shell.burst && !shell.idleTimer) {
+      shell.idleTimer = setTimeout(() => this._reapBurstShell(shell), BURST_IDLE_MS);
+    }
     this._dispatch();
   }
 
@@ -948,6 +967,7 @@ class MuseBridge {
   _killShell(shell) {
     if (!shell.alive) return;
     shell.alive = false;
+    if (shell.idleTimer) { clearTimeout(shell.idleTimer); shell.idleTimer = null; }
     if (this._shellPool) {
       const idx = this._shellPool.indexOf(shell);
       if (idx !== -1) this._shellPool.splice(idx, 1);
@@ -957,12 +977,14 @@ class MuseBridge {
       shell.current = null;
     }
     this._taskkillPid(shell.child.pid);
-    this._respawn();
+    if (!shell.burst) this._respawn(); // 基线 shell 补位; burst 不补 (用完即走)
+    else this._dispatch(); // burst 走了, 看看排队里还有没有活
   }
 
   _onShellDead(shell) {
     if (!shell.alive) return; // 已处理 (如 _killShell)
     shell.alive = false;
+    if (shell.idleTimer) { clearTimeout(shell.idleTimer); shell.idleTimer = null; }
     if (this._shellPool) {
       const idx = this._shellPool.indexOf(shell);
       if (idx !== -1) this._shellPool.splice(idx, 1);
@@ -973,13 +995,15 @@ class MuseBridge {
       shell.current = null;
       job.resolve({ exit: -1, stdout: '', stderr: 'shell died unexpectedly' });
     }
-    this._respawn();
+    if (!shell.burst) this._respawn();
+    else this._dispatch();
   }
 
   _destroyPool() {
     if (!this._shellPool) return;
     for (const shell of this._shellPool) {
       shell.alive = false;
+      if (shell.idleTimer) { clearTimeout(shell.idleTimer); shell.idleTimer = null; }
       if (shell.current) {
         const job = shell.current;
         clearTimeout(job.timer);
