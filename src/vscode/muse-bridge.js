@@ -10,9 +10,24 @@
 const vscode = require('vscode');
 const { execFile } = require('child_process');
 const fs = require('fs');
+const net = require('net');
 const path = require('path');
+const tls = require('tls');
 const zlib = require('zlib');
 const WebSocket = require('ws');
+
+// 自定义证书名校验: 修复 Node 在某些版本上校验 IP SAN 证书的坑
+// (默认校验对 IP 证书会误报 "Cert does not contain a DNS name")。
+// 只放行 IP 与证书 IP SAN 匹配的情况; 链信任仍由 Node 单独验证, 不弱化安全。
+// IP 不匹配时回落默认校验, 由默认校验给出正确报错。
+function checkServerIdentityIP(host, cert) {
+  if (net.isIP(host)) {
+    const san = cert.subjectaltname || '';
+    const ips = [...san.matchAll(/IP Address:([^,]+)/g)].map((m) => m[1].trim());
+    if (ips.includes(host)) return undefined; // 接受
+  }
+  return tls.checkServerIdentity(host, cert);
+}
 
 const SECRET_KEY = 'muse_bridge.token';
 const DEFAULT_HOST = '38.207.167.51'; // 443: 与 browser-gateway 同端口,经 nginx ALPN 分流
@@ -275,7 +290,11 @@ class MuseBridge {
     this.log(`正在连接 ${url} ...`);
     let ws;
     try {
-      ws = new WebSocket(url, { headers: { 'X-Bridge-Token': token }, handshakeTimeout: 15000 });
+      ws = new WebSocket(url, {
+        headers: { 'X-Bridge-Token': token },
+        handshakeTimeout: 15000,
+        checkServerIdentity: checkServerIdentityIP,
+      });
     } catch (e) {
       this.log(`创建连接失败: ${e.message}`);
       return this.scheduleReconnect(token, cfg);
