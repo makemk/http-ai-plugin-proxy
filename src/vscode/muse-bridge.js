@@ -386,6 +386,30 @@ class MuseBridge {
     if (msg.type === 'bash_bg') return this.onBgStart(msg);
     if (msg.type === 'bash_output') return this.onBgOutput(msg);
     if (msg.type === 'bash_kill') return this.onBgKill(msg);
+    if (msg.type === 'batch') return this.onBatch(msg);
+  }
+
+  // 批量执行: 一次往返跑 N 条命令, 池内并行。合并为一次审批弹窗。
+  async onBatch(msg) {
+    const raw = Array.isArray(msg.commands) ? msg.commands : [];
+    const list = raw.slice(0, 32).map((c) => ({
+      command: String(c.command || ''),
+      timeout: Math.min(Math.max(parseInt(c.timeout, 10) || 120, 5), 600),
+    })).filter((c) => c.command);
+    if (list.length === 0) return this.sendFileResult(msg.id, { ok: false, error: 'empty batch' });
+
+    const display = `批量执行 ${list.length} 条命令:\n` +
+      list.map((c, i) => `${i + 1}. ${c.command.slice(0, 100)}${c.command.length > 100 ? '...' : ''}`).join('\n');
+    const allReadonly = list.every((c) => READONLY_RE.test(c.command));
+    const approved = await this.checkApproval(display, allReadonly);
+    if (!approved) {
+      this.log(`批量命令 [${msg.id}] 被用户拒绝。`);
+      return this.sendFileResult(msg.id, { ok: false, error: 'rejected by user' });
+    }
+
+    this.log(`批量执行 [${msg.id}]: ${list.length} 条并行`);
+    const results = await Promise.all(list.map((c) => this.execute(c.command, c.timeout)));
+    return this.sendFileResult(msg.id, { ok: true, results });
   }
 
   async onCmd(msg) {
@@ -407,6 +431,7 @@ class MuseBridge {
   async onBgStart(msg) {
     const command = String(msg.command || '');
     const timeout = Math.min(Math.max(parseInt(msg.timeout, 10) || 120, 5), 3600);
+    const stream = !!msg.stream;
     if (!command) return this.sendFileResult(msg.id, { ok: false, error: 'empty command' });
     const approved = await this.checkApproval(command, READONLY_RE.test(command));
     if (!approved) {
@@ -425,14 +450,38 @@ class MuseBridge {
         if (v.exit !== null) { this._bgJobs.delete(k); break; }
       }
     }
-    child.stdout.on('data', (d) => { job.stdout = (job.stdout + d.toString()).slice(-MAX_BG_BUFFER); });
-    child.stderr.on('data', (d) => { job.stderr = (job.stderr + d.toString()).slice(-MAX_BG_BUFFER); });
+    // 流式: 有输出就主动推 bg_chunk (服务端转发给等待的 /bg-stream 客户端)
+    const pushChunk = (data) => {
+      if (!stream || !this.ws || this.ws.readyState !== 1) return;
+      try {
+        this.ws.send(JSON.stringify({ type: 'bg_chunk', id: msg.id, job_id: jobId, data: String(data).slice(-65536) }));
+      } catch (_) {}
+    };
+    child.stdout.on('data', (d) => {
+      const s = d.toString();
+      job.stdout = (job.stdout + s).slice(-MAX_BG_BUFFER);
+      pushChunk(s);
+    });
+    child.stderr.on('data', (d) => {
+      const s = d.toString();
+      job.stderr = (job.stderr + s).slice(-MAX_BG_BUFFER);
+      pushChunk(s);
+    });
     // 必须监听 error: 否则 spawn 失败时未捕获的 error 事件会崩扩展宿主
     child.on('error', (err) => { job.exit = -1; job.stderr += `\n[SPAWN ERROR] ${err.message}`; });
     // exit 在进程退出时触发 (不等 stdio 管道关闭); close 在管道关闭时触发。
     // 只用 close 会漏: 子进程(如 sleep)还占着管道时 close 不触发, 任务永远显示 running。
     // code 为 null 表示被信号杀死, 记为 -1。
-    const markDone = (code) => { if (job.exit === null) job.exit = code !== null ? code : -1; };
+    const markDone = (code) => {
+      if (job.exit === null) {
+        job.exit = code !== null ? code : -1;
+        if (stream && this.ws && this.ws.readyState === 1) {
+          try {
+            this.ws.send(JSON.stringify({ type: 'bg_chunk', id: msg.id, job_id: jobId, done: true, exit: job.exit }));
+          } catch (_) {}
+        }
+      }
+    };
     child.on('exit', markDone);
     child.on('close', markDone);
     setTimeout(() => {
@@ -451,6 +500,7 @@ class MuseBridge {
     this.sendFileResult(msg.id, {
       ok: true, job_id: String(msg.job_id), running: job.exit === null,
       stdout: job.stdout.slice(-MAX_OUTPUT), stderr: job.stderr.slice(-MAX_OUTPUT), exit: job.exit,
+      truncated: job.stdout.length > MAX_OUTPUT || job.stderr.length > MAX_OUTPUT,
     });
   }
 
@@ -910,7 +960,11 @@ class MuseBridge {
       if (shell.idleTimer) { clearTimeout(shell.idleTimer); shell.idleTimer = null; } // burst shell 复用, 取消回收
       shell.buffer = ''; // 丢弃残留 (防御)
       job.timer = setTimeout(() => this._onJobTimeout(job), job.timeout * 1000);
-      const wrapped = `(\n${job.command}\n) < /dev/null\necho "${job.marker}:$?"\n`;
+      // base64 编码防 breakout: 命令里哪怕有单独一行的 `)`, 也不会提前闭合 subshell。
+      // base64 字母表不含 `_`, heredoc 分隔符 `__MUSE_B64__` 不可能在编码中出现, 绝对安全。
+      // `| bash` 子进程执行, cd/环境变量不泄漏到池 shell (与原来 `( )` 同等隔离)。
+      const b64 = Buffer.from(job.command, 'utf8').toString('base64');
+      const wrapped = `base64 -d << '__MUSE_B64__' | bash\n${b64}\n__MUSE_B64__\necho "${job.marker}:$?"\n`;
       try {
         shell.child.stdin.write(wrapped);
       } catch (_) {
@@ -959,7 +1013,8 @@ class MuseBridge {
     shell.buffer = rest;
     clearTimeout(job.timer);
     shell.current = null;
-    job.resolve({ exit, stdout: stdout.slice(-MAX_OUTPUT), stderr: '' });
+    const truncated = stdout.length > MAX_OUTPUT;
+    job.resolve({ exit, stdout: stdout.slice(-MAX_OUTPUT), stderr: '', truncated });
     // burst shell 空闲后开始倒计时回收 (基线 shell 常驻不回收)
     if (shell.burst && !shell.idleTimer) {
       shell.idleTimer = setTimeout(() => this._reapBurstShell(shell), this._burstIdleMs || BURST_IDLE_MS);
@@ -974,7 +1029,7 @@ class MuseBridge {
     const partial = shell.buffer;
     shell.buffer = '';
     this._killShell(shell);
-    job.resolve({ exit: -1, stdout: partial.slice(-MAX_OUTPUT), stderr: '\n[TIMEOUT] 命令执行超时已被终止' });
+    job.resolve({ exit: -1, stdout: partial.slice(-MAX_OUTPUT), stderr: '\n[TIMEOUT] 命令执行超时已被终止', truncated: partial.length > MAX_OUTPUT });
   }
 
   _killShell(shell) {
