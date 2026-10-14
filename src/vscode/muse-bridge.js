@@ -14,7 +14,7 @@ const zlib = require('zlib');
 const WebSocket = require('ws');
 
 const SECRET_KEY = 'muse_bridge.token';
-const DEFAULT_HOST = '38.207.167.51:9443';
+const DEFAULT_HOST = '38.207.167.51'; // 443: 与 browser-gateway 同端口,经 nginx ALPN 分流
 const GIT_BASH_CANDIDATES = [
   'C:\\Program Files\\Git\\bin\\bash.exe',
   'C:\\Program Files (x86)\\Git\\bin\\bash.exe',

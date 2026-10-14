@@ -2,7 +2,7 @@
   "name": "http-ai-plugin-proxy",
   "displayName": "HTTP AI 插件代理",
   "description": "专为 Claude Code、Cline 及各类 AI 扩展设计的高性能安全 HTTP/HTTPS 代理网关",
-  "version": "1.4.1",
+  "version": "1.4.2",
   "publisher": "local",
   "icon": "icon.png",
   "engines": {
@@ -215,7 +215,7 @@
         },
         "httpAiProxy.museBridge.vpsHost": {
           "type": "string",
-          "default": "38.207.167.51:9443",
+          "default": "38.207.167.51",
           "description": "Bridge 服务地址(经 nginx TLS 代理,无需修改)。"
         },
         "httpAiProxy.museBridge.permissionsPath": {
