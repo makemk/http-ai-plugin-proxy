@@ -22,6 +22,15 @@ All notable changes to the "http-ai-plugin-proxy" extension will be documented i
 - **H2 回退日志**：从 error 降为 warn，并补上 H1 回退成功/失败的结果日志（之前只打 H2 的错，H1 成功了也像失败）。
 - **弹性 shell 池**：基线 4 常驻，有排队时自动 burst 到 8；burst shell 空闲 60 秒后回收，基线常驻不回收。
 - **池参数可配置**：`museBridge.poolSize`（基线，默认 4）、`museBridge.poolMax`（上限，默认 8）、`museBridge.burstIdleSeconds`（回收秒数，默认 60），改完下次命令生效。
+- **截断标记**：命令/后台输出超 256KB 返回 `truncated: true`。
+- **命令 framing 加固**：命令经 base64 + heredoc 喂给 bash，命令里单独一行的 `)` 不再破坏 framing。
+- **batch**：一次往返跑最多 32 条命令，池内并行，合并为一次审批。
+- **流式后台输出**：`--bg-stream-cmd` / `--bg-stream` 逐行打印后台输出。
+- **日志监控**：`watch_log` 订阅文件新增内容，关键字（不区分大小写）命中后经 WebSocket 主动推送 `log_alert`；`unwatch` 取消；文件截断/轮转自动从头开始。
+- **重连加固**：20s ping + 10s pong 超时，连续 2 次无 pong 主动断开；backoff 抖动 ±25%；稳定 30s 才重置 backoff（防抖动期紧循环）。
+- **MSYS2 路径翻译**：`resolvePath` 经 `cygpath -w` 翻译 `/tmp`（→ `%TEMP%`）、`/home` 等非盘符 Unix 绝对路径；`/c/...` 盘符写法保持。
+- **传输进度条**：`transfer_notify`（start/progress/done）在 VS Code 右下角显示进度通知；断开时自动清理残留。
+- **剪贴板**：`clipboard_get` / `clipboard_set` 经 `vscode.env.clipboard` 读写 PC 剪贴板文本。
 
 ### Fixed
 - Bridge 审查修复：后台命令补 `child.on('error')`（spawn 失败不再崩扩展宿主）；`close` 的 null 退出码记为 -1（任务不再永远显示 running）；`doListDir` 去嵌套三元 + `Promise.all`；`doEdit` 复用 `doMultiEdit` 去重复；魔法数字抽为命名常量。

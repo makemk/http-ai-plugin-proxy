@@ -293,6 +293,13 @@ class MuseBridge {
       try { clearInterval(w.interval); } catch (_) {}
     }
     this._watches.clear();
+    // 清理传输进度条 (断开时残留)
+    if (this._transfers) {
+      for (const [, t] of this._transfers) {
+        try { t.done(); } catch (_) {}
+      }
+      this._transfers.clear();
+    }
     if (this.reconnectTimer) {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;
