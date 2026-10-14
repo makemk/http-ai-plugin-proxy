@@ -8,7 +8,6 @@
  *   - token 存于 VS Code SecretStorage,不落配置文件
  */
 const vscode = require('vscode');
-const { execFile } = require('child_process');
 const fs = require('fs');
 const net = require('net');
 const path = require('path');
@@ -54,6 +53,7 @@ const READONLY_RE = /^\s*(echo|ls|dir|cat|type|pwd|cd|whoami|hostname|uname|df|d
 const DANGEROUS_RE = /\b(rm\s+-rf?\s+\/|del\s+\/[fsq]\s+[a-z]:\\|format\s+[a-z]:|mkfs|shutdown(\.exe)?\s+\/|reboot|reg\s+delete|rd\s+\/s\s+[a-z]:\\)/i;
 
 const MAX_OUTPUT = 256 * 1024;
+const POOL_SIZE = 4; // 常驻 shell 池大小 (并发路数)
 const MAX_BG_BUFFER = 1024 * 1024; // 后台命令单流输出上限
 const MAX_BG_JOBS = 30; // 后台任务保留上限
 const MAX_GREP_FILE = 4 * 1024 * 1024; // grep 单文件上限, 超过跳过
@@ -141,6 +141,9 @@ class MuseBridge {
     this.stopping = false;
     this._bgJobs = new Map();
     this._bgSeq = 0;
+    this._shellPool = null; // 懒创建: 首个命令时建池
+    this._shellQueue = [];
+    this._poolSeq = 0;
     this.statusItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100);
     this.statusItem.command = 'museBridge.status';
     context.subscriptions.push(this.statusItem);
@@ -271,6 +274,7 @@ class MuseBridge {
 
   stop() {
     this.stopping = true;
+    this._destroyPool();
     if (this.reconnectTimer) {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;
@@ -442,10 +446,7 @@ class MuseBridge {
   // 杀整棵进程树: child.kill() 只杀 sh.exe, 其子进程(如 sleep)会活着并占住管道。
   // taskkill /T /F 杀掉树上全部进程, 管道随之关闭, close 事件才能触发。
   _killJobTree(job) {
-    try {
-      const { execFile } = require('child_process');
-      execFile('taskkill', ['/F', '/T', '/PID', String(job.child.pid)], () => {});
-    } catch (_) {}
+    this._taskkillPid(job.child.pid);
   }
 
   async onBgKill(msg) {
@@ -823,26 +824,193 @@ class MuseBridge {
     return choice === '执行';
   }
 
-  execute(command, timeout) {
+  // ---- 常驻 shell 池: 复用进程 (省每次 spawn) + 并发 (多 shell) + 子 shell 隔离 (无状态残留) ----
+  // 每个命令包进子 shell: (\n命令\n) < /dev/null\necho "标记:$?"
+  //  - 子 shell: cd/环境变量/函数只在子 shell 生效, 父 shell 永远干净
+  //  - < /dev/null: 命令读 stdin 时直接 EOF, 不会吃掉后续的分隔符
+  //  - 多行形式: heredoc 的结束符必须独占一行, 单行拼接会把分隔符吞进 heredoc
+  //  - stdout/stderr 合并成一个流 (省双流竞态), stderr 字段为空
+  //  - 池 shell 启动时 cwd = 首个工作区根 (pwd/ls 默认就是工作区)
+  ensurePool() {
+    if (this._shellPool) return;
+    this._shellPool = [];
+    this._shellQueue = [];
+    for (let i = 0; i < POOL_SIZE; i++) {
+      const shell = this._spawnShell();
+      if (shell) this._shellPool.push(shell);
+    }
+  }
+
+  _spawnShell() {
     const bash = this.resolveBash();
+    if (!bash) return null;
+    const folders = (vscode.workspace.workspaceFolders || []).map((f) => f.uri.fsPath);
+    const cwd = folders.length ? folders[0] : undefined;
+    const { spawn } = require('child_process');
+    const child = spawn(bash, ['-l'], { cwd, windowsHide: true });
+    const shell = {
+      child, buffer: '', current: null, alive: true, ready: false,
+      readyMarker: `__MUSE_READY_${Date.now().toString(36)}${(this._poolSeq++).toString(36)}__`,
+    };
+    child.stdout.on('data', (d) => this._onShellData(shell, d.toString()));
+    child.stderr.on('data', (d) => this._onShellData(shell, d.toString()));
+    child.on('error', () => this._onShellDead(shell));
+    child.on('close', () => this._onShellDead(shell));
+    try { child.stdin.write(`echo "${shell.readyMarker}"\n`); } catch (_) { /* spawn 失败时 error 事件会处理 */ }
+    // 兜底: 10 秒还不就绪 (bash 启动挂住), 杀掉重开, 不让它占着池位
+    setTimeout(() => { if (!shell.ready && shell.alive) this._killShell(shell); }, 10000);
+    return shell;
+  }
+
+  _taskkillPid(pid) {
+    try {
+      const { execFile } = require('child_process');
+      execFile('taskkill', ['/F', '/T', '/PID', String(pid)], () => {});
+    } catch (_) {}
+  }
+
+  _respawn() {
+    const replacement = this._spawnShell();
+    if (replacement && this._shellPool) this._shellPool.push(replacement);
+    this._dispatch();
+  }
+
+  _dispatch() {
+    if (!this._shellPool) return;
+    // 兜底: 池空了 (shell 全死且 Git Bash 消失), 排队任务不再挂起
+    if (this._shellPool.length === 0 && this._shellQueue.length > 0) {
+      for (const job of this._shellQueue) {
+        job.resolve({ exit: -1, stdout: '', stderr: 'Git Bash not found' });
+      }
+      this._shellQueue = [];
+      return;
+    }
+    for (const shell of this._shellPool) {
+      if (this._shellQueue.length === 0) break;
+      if (!shell.alive || !shell.ready || shell.current) continue;
+      const job = this._shellQueue.shift();
+      shell.current = job;
+      job.shell = shell;
+      shell.buffer = ''; // 丢弃残留 (防御)
+      job.timer = setTimeout(() => this._onJobTimeout(job), job.timeout * 1000);
+      const wrapped = `(\n${job.command}\n) < /dev/null\necho "${job.marker}:$?"\n`;
+      try {
+        shell.child.stdin.write(wrapped);
+      } catch (_) {
+        clearTimeout(job.timer);
+        shell.current = null;
+        this._onShellDead(shell);
+        job.resolve({ exit: -1, stdout: '', stderr: 'shell stdin closed' });
+      }
+    }
+  }
+
+  _onShellData(shell, chunk) {
+    shell.buffer = (shell.buffer + chunk).slice(-MAX_BG_BUFFER);
+    if (!shell.ready) {
+      // 就绪探针: shell 启动完成 (profile 加载完) 且缓冲区干净后才接任务
+      const idx = shell.buffer.indexOf(shell.readyMarker);
+      if (idx === -1) return;
+      shell.ready = true;
+      shell.buffer = '';
+      this._dispatch();
+      return;
+    }
+    const job = shell.current;
+    if (!job) return;
+    const idx = shell.buffer.indexOf(job.marker);
+    if (idx === -1) return;
+    const after = shell.buffer.slice(idx + job.marker.length);
+    const m = /^:(-?\d+)/.exec(after);
+    if (!m) return; // 退出码还没收全, 等更多数据
+    const exit = parseInt(m[1], 10);
+    const stdout = shell.buffer.slice(0, idx);
+    let rest = after.slice(m[0].length);
+    if (rest.startsWith('\r\n')) rest = rest.slice(2);
+    else if (rest.startsWith('\n')) rest = rest.slice(1);
+    shell.buffer = rest;
+    clearTimeout(job.timer);
+    shell.current = null;
+    job.resolve({ exit, stdout: stdout.slice(-MAX_OUTPUT), stderr: '' });
+    this._dispatch();
+  }
+
+  _onJobTimeout(job) {
+    const shell = job.shell;
+    if (!shell || shell.current !== job) return; // 已完成, 定时器是残留
+    shell.current = null;
+    const partial = shell.buffer;
+    shell.buffer = '';
+    this._killShell(shell);
+    job.resolve({ exit: -1, stdout: partial.slice(-MAX_OUTPUT), stderr: '\n[TIMEOUT] 命令执行超时已被终止' });
+  }
+
+  _killShell(shell) {
+    if (!shell.alive) return;
+    shell.alive = false;
+    if (this._shellPool) {
+      const idx = this._shellPool.indexOf(shell);
+      if (idx !== -1) this._shellPool.splice(idx, 1);
+    }
+    if (shell.current) {
+      clearTimeout(shell.current.timer);
+      shell.current = null;
+    }
+    this._taskkillPid(shell.child.pid);
+    this._respawn();
+  }
+
+  _onShellDead(shell) {
+    if (!shell.alive) return; // 已处理 (如 _killShell)
+    shell.alive = false;
+    if (this._shellPool) {
+      const idx = this._shellPool.indexOf(shell);
+      if (idx !== -1) this._shellPool.splice(idx, 1);
+    }
+    if (shell.current) {
+      const job = shell.current;
+      clearTimeout(job.timer);
+      shell.current = null;
+      job.resolve({ exit: -1, stdout: '', stderr: 'shell died unexpectedly' });
+    }
+    this._respawn();
+  }
+
+  _destroyPool() {
+    if (!this._shellPool) return;
+    for (const shell of this._shellPool) {
+      shell.alive = false;
+      if (shell.current) {
+        const job = shell.current;
+        clearTimeout(job.timer);
+        shell.current = null;
+        job.resolve({ exit: -1, stdout: '', stderr: 'bridge stopped' });
+      }
+      this._taskkillPid(shell.child.pid);
+    }
+    this._shellPool = null;
+    for (const job of this._shellQueue) {
+      job.resolve({ exit: -1, stdout: '', stderr: 'bridge stopped' });
+    }
+    this._shellQueue = [];
+  }
+
+  execute(command, timeout) {
+    if (this.stopping) {
+      return Promise.resolve({ exit: -1, stdout: '', stderr: 'bridge stopped' });
+    }
+    this.ensurePool();
+    if (!this._shellPool || this._shellPool.length === 0) {
+      return Promise.resolve({ exit: -1, stdout: '', stderr: 'Git Bash not found' });
+    }
     return new Promise((resolve) => {
-      execFile(bash, ['-l', '-c', command], {
-        timeout: timeout * 1000,
-        maxBuffer: 4 * 1024 * 1024,
-        windowsHide: true,
-      }, (err, stdout, stderr) => {
-        let exit = 0;
-        let errText = stderr || '';
-        if (err) {
-          exit = typeof err.code === 'number' ? err.code : -1;
-          if (err.killed) errText += '\n[TIMEOUT] 命令执行超时已被终止';
-        }
-        resolve({
-          exit,
-          stdout: (stdout || '').slice(-MAX_OUTPUT),
-          stderr: String(errText).slice(-MAX_OUTPUT),
-        });
-      });
+      const job = {
+        command, timeout,
+        resolve, timer: null, shell: null,
+        marker: `__MUSE_END_${Date.now().toString(36)}${(this._poolSeq++).toString(36)}__`,
+      };
+      this._shellQueue.push(job);
+      this._dispatch();
     });
   }
 

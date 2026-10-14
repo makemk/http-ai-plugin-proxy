@@ -17,6 +17,7 @@ All notable changes to the "http-ai-plugin-proxy" extension will be documented i
 - **`diagnostics`**：拉 VS Code 语言服务器诊断（报错/警告/信息/提示），全部文件或指定文件，上限 500 条。
 - **只读模式（计划模式）**：配置 `httpAiProxy.museBridge.readOnly` + 命令 `Bridge: 切换只读模式(计划模式)`；开启后所有写操作一律拒绝，只允许读。
 - **图片读取**：由现有 `--download` 覆盖（原字节下载），无需新 op。
+- **常驻 shell 池**：命令执行改走 4 个常驻 `sh.exe`（复用进程，省每次 spawn 的 ~300-500ms），多 shell 并发；每个命令包进子 shell（`cd`/环境变量不泄漏）+ `< /dev/null`（防 stdin 吞分隔符）+ 多行形式（heredoc 正常）；随机分隔符收输出，stdout/stderr 合并；超时/死亡时 taskkill 整棵树 + 重开补位；池 shell 启动时 cwd = 首个工作区根；就绪探针（profile 加载完才接任务）+ 10 秒就绪超时兜底。
 
 ### Fixed
 - Bridge 审查修复：后台命令补 `child.on('error')`（spawn 失败不再崩扩展宿主）；`close` 的 null 退出码记为 -1（任务不再永远显示 running）；`doListDir` 去嵌套三元 + `Promise.all`；`doEdit` 复用 `doMultiEdit` 去重复；魔法数字抽为命名常量。
