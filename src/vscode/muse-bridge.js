@@ -146,10 +146,7 @@ class MuseBridge {
     this._shellPool = null; // 懒创建: 首个命令时建池
     this._shellQueue = [];
     this._poolSeq = 0;
-    this.statusItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100);
-    this.statusItem.command = 'museBridge.status';
-    context.subscriptions.push(this.statusItem);
-    this.setStatus('off');
+
     // 池参数变更时重建池子 (下次命令懒创建, 用新参数)
     this._configWatcher = vscode.workspace.onDidChangeConfiguration((e) => {
       if (e.affectsConfiguration('httpAiProxy.museBridge.poolSize') ||
@@ -166,17 +163,8 @@ class MuseBridge {
     this.out.appendLine(`[MuseBridge] ${msg}`);
   }
 
-  setStatus(s, detail = '') {
-    const map = {
-      off: '$(circle-slash) Bridge 关',
-      connecting: '$(sync~spin) Bridge 连接中',
-      online: '$(check) Bridge 在线',
-      error: '$(error) Bridge 异常',
-    };
-    this.statusItem.text = map[s] || map.off;
-    this.statusItem.tooltip = `Muse Bridge: ${s}${detail ? ' - ' + detail : ''}`;
-    this.statusItem.show();
-  }
+  // 状态栏已移除 (用户看代理面板)。保留方法以免改所有调用处。
+  setStatus(s, detail = '') {}
 
   getConfig() {
     const cfg = vscode.workspace.getConfiguration('httpAiProxy');
