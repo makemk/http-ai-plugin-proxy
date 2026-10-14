@@ -523,8 +523,6 @@ class MuseBridge {
 
   // 大文件传输进度通知: 在 VS Code 右下角显示进度条。
   // msg: { type:'transfer_notify', tid, phase:'start'|'progress'|'done', label, message }
-  // 大文件传输进度通知: 在 VS Code 右下角显示进度条。
-  // msg: { type:'transfer_notify', tid, phase:'start'|'progress'|'done', label, message }
   onTransferNotify(msg) {
     const tid = String(msg.tid || '');
     const phase = String(msg.phase || '');
