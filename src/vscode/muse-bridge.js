@@ -335,11 +335,12 @@ class MuseBridge {
     }
     this.ws = ws;
 
+    // 心跳状态 (声明在 handler 之前, 避免 TDZ)
+    let pongMissed = 0;
+    let pongTimer = null;
+
     ws.on('open', () => {
-      const openedAt = Date.now();
       // 只有稳定在线超 30s 才重置 backoff; 刚连上就掉线(抖动期)不重置, 避免紧循环 hammer
-      const prevDelay = this.reconnectDelay;
-      this._openAt = openedAt;
       this.setStatus('online');
       this.log('Bridge 已上线,等待 Muse 的命令。');
       ws.send(JSON.stringify({
@@ -359,7 +360,7 @@ class MuseBridge {
 
     ws.on('close', (code) => {
       if (this.ws === ws) this.ws = null;
-      try { clearTimeout(pongTimer); } catch (_) {}
+      if (pongTimer) clearTimeout(pongTimer);
       this.setStatus('error', `连接断开 (${code})`);
       this.log(`连接断开 (code=${code}),准备重连...`);
       this.scheduleReconnect(token, cfg);
@@ -371,8 +372,6 @@ class MuseBridge {
 
     // 应用层心跳: ping -> pong, 连续 2 次无 pong 则判定半开死亡, 主动 terminate 触发重连。
     // (之前只发 ping 不收 pong, 半开连接要等 OS 超时(分钟级)才发现。)
-    let pongMissed = 0;
-    let pongTimer = null;
     const pingTimer = setInterval(() => {
       if (ws.readyState !== WebSocket.OPEN) {
         clearInterval(pingTimer);
