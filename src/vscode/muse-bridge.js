@@ -414,11 +414,15 @@ class MuseBridge {
     child.stderr.on('data', (d) => { job.stderr = (job.stderr + d.toString()).slice(-MAX_BG_BUFFER); });
     // 必须监听 error: 否则 spawn 失败时未捕获的 error 事件会崩扩展宿主
     child.on('error', (err) => { job.exit = -1; job.stderr += `\n[SPAWN ERROR] ${err.message}`; });
-    // close 的 code 为 null 表示被信号杀死, 记为 -1, 否则任务永远显示 running
-    child.on('close', (code) => { job.exit = code !== null ? code : -1; });
+    // exit 在进程退出时触发 (不等 stdio 管道关闭); close 在管道关闭时触发。
+    // 只用 close 会漏: 子进程(如 sleep)还占着管道时 close 不触发, 任务永远显示 running。
+    // code 为 null 表示被信号杀死, 记为 -1。
+    const markDone = (code) => { if (job.exit === null) job.exit = code !== null ? code : -1; };
+    child.on('exit', markDone);
+    child.on('close', markDone);
     setTimeout(() => {
       if (job.exit === null) {
-        try { child.kill(); } catch (_) {}
+        this._killJobTree(job);
         job.stderr += '\n[TIMEOUT] 后台命令超时已被终止';
       }
     }, timeout * 1000);
@@ -435,11 +439,20 @@ class MuseBridge {
     });
   }
 
+  // 杀整棵进程树: child.kill() 只杀 sh.exe, 其子进程(如 sleep)会活着并占住管道。
+  // taskkill /T /F 杀掉树上全部进程, 管道随之关闭, close 事件才能触发。
+  _killJobTree(job) {
+    try {
+      const { execFile } = require('child_process');
+      execFile('taskkill', ['/F', '/T', '/PID', String(job.child.pid)], () => {});
+    } catch (_) {}
+  }
+
   async onBgKill(msg) {
     const job = this._bgJobs.get(String(msg.job_id || ''));
     if (!job) return this.sendFileResult(msg.id, { ok: false, error: 'unknown job_id' });
     if (job.exit !== null) return this.sendFileResult(msg.id, { ok: true, killed: false, exit: job.exit });
-    try { job.child.kill(); } catch (_) {}
+    this._killJobTree(job);
     this.sendFileResult(msg.id, { ok: true, killed: true, exit: job.exit });
   }
 
