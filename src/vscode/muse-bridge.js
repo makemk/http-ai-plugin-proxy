@@ -675,10 +675,27 @@ class MuseBridge {
   // 路径解析 (Claude Code 式): 相对路径优先工作区, 绝对路径直接用。
   // Git Bash 风格 /c/Users/... 转 Windows 盘符; 相对路径按工作区顺序找, 找到存在的就用,
   // 都不存在则落到首个工作区 (写新文件时就是这种情况)。
+  // MSYS2 根目录 (= Git Bash 的 /): <root>\bin\sh.exe -> <root>
+  getMsysRoot() {
+    if (this._msysRoot !== undefined) return this._msysRoot;
+    const bash = this.resolveBash();
+    this._msysRoot = bash ? path.dirname(path.dirname(bash)) : null;
+    return this._msysRoot;
+  }
+
   resolvePath(p) {
     let s = String(p || '');
-    const m = /^\/([a-zA-Z])\/.*/.exec(s);
-    if (m) s = `${m[1].toUpperCase()}:\\${s.slice(3).replace(/\//g, '\\')}`;
+    // /c/... -> C:\... (Git Bash 盘符写法)
+    const m = /^\/([a-zA-Z])(\/.*)?$/.exec(s);
+    if (m) return `${m[1].toUpperCase()}:${(m[2] || '').replace(/\//g, '\\')}`;
+    // MSYS2 绝对路径 (/tmp, /home, ...): 经 MSYS2 根目录翻译。
+    // 必须在 win32.isAbsolute 之前: '/tmp' 在 win32 视角也是 absolute (drive-relative),
+    // 会被原样返回, 但它实际是 Git Bash 的 <git>\tmp, 不是 <盘符>:\tmp。
+    if (s.startsWith('/')) {
+      const root = this.getMsysRoot();
+      if (root) return path.win32.join(root, s.slice(1).replace(/\//g, '\\'));
+      return s; // 拿不到 MSYS2 根: 保持旧行为
+    }
     if (path.win32.isAbsolute(s)) return s;
     const folders = (vscode.workspace.workspaceFolders || []).map((f) => f.uri.fsPath);
     for (const dir of folders) {
