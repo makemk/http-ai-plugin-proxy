@@ -675,12 +675,24 @@ class MuseBridge {
   // 路径解析 (Claude Code 式): 相对路径优先工作区, 绝对路径直接用。
   // Git Bash 风格 /c/Users/... 转 Windows 盘符; 相对路径按工作区顺序找, 找到存在的就用,
   // 都不存在则落到首个工作区 (写新文件时就是这种情况)。
-  // MSYS2 根目录 (= Git Bash 的 /): <root>\bin\sh.exe -> <root>
-  getMsysRoot() {
-    if (this._msysRoot !== undefined) return this._msysRoot;
+  // MSYS2 路径翻译表: { root: '/', tmp: '/tmp' 的 Windows 路径 }
+  // (/tmp 是特殊挂载, 不在 git 根下, 必须用 cygpath 拿权威值)
+  getMsysPaths() {
+    if (this._msysPaths !== undefined) return this._msysPaths;
     const bash = this.resolveBash();
-    this._msysRoot = bash ? path.dirname(path.dirname(bash)) : null;
-    return this._msysRoot;
+    if (!bash) { this._msysPaths = null; return null; }
+    const gitRoot = path.dirname(path.dirname(bash));
+    const cygpath = path.join(gitRoot, 'usr', 'bin', 'cygpath.exe');
+    try {
+      const cp = require('child_process');
+      const root = cp.execFileSync(cygpath, ['-w', '/'], { encoding: 'utf8' }).trim();
+      const tmp = cp.execFileSync(cygpath, ['-w', '/tmp'], { encoding: 'utf8' }).trim();
+      this._msysPaths = { root, tmp };
+    } catch (_) {
+      // cygpath 不可用: 兜底启发式
+      this._msysPaths = { root: gitRoot, tmp: path.join(gitRoot, 'tmp') };
+    }
+    return this._msysPaths;
   }
 
   resolvePath(p) {
@@ -688,13 +700,18 @@ class MuseBridge {
     // /c/... -> C:\... (Git Bash 盘符写法)
     const m = /^\/([a-zA-Z])(\/.*)?$/.exec(s);
     if (m) return `${m[1].toUpperCase()}:${(m[2] || '').replace(/\//g, '\\')}`;
-    // MSYS2 绝对路径 (/tmp, /home, ...): 经 MSYS2 根目录翻译。
+    // MSYS2 绝对路径 (/tmp, /home, ...): 经 cygpath 翻译表转换。
     // 必须在 win32.isAbsolute 之前: '/tmp' 在 win32 视角也是 absolute (drive-relative),
-    // 会被原样返回, 但它实际是 Git Bash 的 <git>\tmp, 不是 <盘符>:\tmp。
+    // 会被原样返回, 但它实际可能是挂载到别处的目录 (如 %TEMP%)。
     if (s.startsWith('/')) {
-      const root = this.getMsysRoot();
-      if (root) return path.win32.join(root, s.slice(1).replace(/\//g, '\\'));
-      return s; // 拿不到 MSYS2 根: 保持旧行为
+      const mp = this.getMsysPaths();
+      if (mp) {
+        if (s === '/tmp' || s.startsWith('/tmp/')) {
+          return path.win32.join(mp.tmp, s.slice(4).replace(/\//g, '\\'));
+        }
+        return path.win32.join(mp.root, s.slice(1).replace(/\//g, '\\'));
+      }
+      return s; // 拿不到翻译表: 保持旧行为
     }
     if (path.win32.isAbsolute(s)) return s;
     const folders = (vscode.workspace.workspaceFolders || []).map((f) => f.uri.fsPath);
